@@ -1,0 +1,15 @@
+# Configuracion personal
+*.env
+config.json
+secrets.pine
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db

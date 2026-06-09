@@ -1,0 +1,3239 @@
+//@version=6
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Orderflow MNQ — VP + CVD + Delta
+//  Version : 3.1 LIVE — 5M Edition
+//  TF      : M5 | Instrument: MNQ
+//            - SL estructural: extremo de vela + buffer (no ATR)
+//  Cambios : - Migrado a 5M (MR + TF nativos, sin request.security)
+//            - SL dinámico ATR(10) × multiplicador configurable
+//            - Riesgo fijo $400 → qty calculado por trade
+//            - alert() freq_all + guardia int (sin delay de 14s)
+//            - Cooldown 12 barras 5M = 60 min (igual que 60 barras 1M)
+//            - Lookback 10 barras 5M ≈ 50 min
+//            - Ventana de entrada ampliada a 90 min
+// ═══════════════════════════════════════════════════════════════════════════════
+
+indicator("OF MNQ — 5M v3.1",
+          overlay          = true,
+          max_bars_back    = 5000,
+          max_lines_count  = 500,
+          max_labels_count = 500)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  INPUTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+grp_live        = "★ LIVE"
+i_fill_real_top = input.float(0.0, "Fill real (0 = teórico)", group=grp_live, minval=0.0, step=0.25,
+     tooltip="Ingresa el precio de fill real de Tradovate.\nSolo actualiza el precio de entrada visible en los dashboards.\nSL y TPs no cambian — ya están fijos en Tradovate.\n0 = usa el precio teórico de la señal.")
+
+grp_vp          = "── Volume Profile ──"
+i_vp_bucket_pts = input.float(10.0, "Bucket Size (points)",     group=grp_vp, minval=1.0, step=5.0)
+i_va_pct        = input.float(70.0, "Value Area %",             group=grp_vp, minval=50.0, maxval=95.0, step=5.0)
+i_show_prev_vp  = input.bool(true,  "Show Previous Session VP", group=grp_vp)
+i_show_curr_vp  = input.bool(true,  "Show Current Session VP",  group=grp_vp)
+
+grp_cvd         = "── CVD / Delta ──"
+i_cvd_reset     = input.bool(true,  "Reset CVD at Session Open", group=grp_cvd)
+i_div_lookback  = input.int(10,     "Divergence Lookback (bars)",  group=grp_cvd, minval=3, maxval=50,
+     tooltip="10 barras 5M ≈ 50 min de sesión. Equivale al lookback de 20 en 1M.")
+i_delta_thresh  = input.float(30.0, "Delta Strength % (0=off)",   group=grp_cvd, minval=0.0, maxval=100.0)
+i_show_delta_bars = input.bool(true, "Mostrar barras delta en precio", group=grp_cvd)
+
+grp_sig         = "── Signals ──"
+i_show_signals  = input.bool(true,  "Show Entry Signals",   group=grp_sig)
+i_show_mode_bg  = input.bool(false, "Show Mode Background", group=grp_sig)
+i_label_offset  = input.int(4,      "Label offset (bars)",  group=grp_sig, minval=1, maxval=15,
+     tooltip="En 5M usa valores menores — 4 barras = 20 min de separación visual.")
+i_enable_mr     = input.bool(false, "Activar modo MR (rebote VAL/VAH)", group=grp_sig,
+     tooltip="MR = Mean Reversion. Señales dentro del Value Area.\nDesactivado por defecto en 5M — el ruido es mayor que en 1M.\nActiva solo para comparar en BT.")
+i_enable_tf     = input.bool(true,  "Activar modo TF (breakout VAH/VAL)", group=grp_sig,
+     tooltip="TF = Trend Following. Señales fuera del Value Area.\nModo principal en 5M — confirmación por cierre de vela.")
+
+grp_dir         = "── Dirección ──"
+i_dir_filter    = input.string("Ambas", "Filtro de dirección (manual)",
+     options=["Ambas", "Solo LONG", "Solo SHORT"],
+     group=grp_dir,
+     tooltip="Filtro MANUAL. Solo aplica cuando el sesgo automático es NEUTRO o está desactivado.")
+i_bias_auto     = input.bool(true, "Sesgo de período automático",
+     group=grp_dir,
+     tooltip="Activa el sesgo automático basado en estructura diaria y semanal.\nScore +2/+3 → Solo LONG automático\nScore -2/-3 → Solo SHORT automático\nScore neutro → usa el filtro manual\nDesactiva para usar siempre el filtro manual.")
+i_bias_strength = input.int(2, "Umbral de sesgo (1-3)",
+     group=grp_dir, minval=1, maxval=3,
+     tooltip="Cuántos factores necesarios para activar el sesgo automático.\n1=sensible  2=equilibrado (recomendado)  3=estricto")
+
+grp_bt          = "── BT / Salida ──"
+i_exit_mode     = input.string("TP en 1R honesto (PMT)", "Modo de salida (BT)",
+     options=["TP en 1R honesto (PMT)", "TP en 2R honesto (PMT)", "TP en 3R honesto (PMT)", "Optimizado: 0.5R-1R-1.5R-2R-3R", "BE en 0.5R + runner a 3R", "50% en 0.5R + runner promedio", "50% en 0.5R + runner en 1R", "50% en 0.5R + 50% libre", "Todo en max R", "50% en 1R + 50% en max R", "50% en 1R + 50% en 3R fijo"],
+     group=grp_bt,
+     tooltip="Modos de salida para comparar PnL en BT.\n\nBE en 0.5R + runner a 3R: refleja la gestión manual óptima.\nSi no toca 0.5R → SL completo (−R)\nSi toca 0.5R pero no 1R → BE buffer (~−0.2R)\nSi llega a 1R → BE exacto → runner gratis\nSi llega a 3R → +3R\nSi llega a 1R-2R y revierte → $0 (BE)\n\nTP en 3R honesto: sin BE, solo gana si llega a 3R.\nTP en 2R honesto: sin BE, solo gana si llega a 2R.\nTodo en max R: cierra en el R más alto alcanzado (optimista, no replicable).")
+
+grp_freq        = "── Signal Frequency ──"
+i_max_signals   = input.int(2,  "Max Signals per Session",          group=grp_freq, minval=1, maxval=10)
+i_cooldown_bars = input.int(12, "Cooldown between signals (bars)",  group=grp_freq, minval=1, maxval=100,
+     tooltip="12 barras 5M = 60 min. Equivale al cooldown de 60 en 1M.")
+
+grp_flt         = "── Filters ──"
+i_min_grade     = input.string("B", "Grade mínimo para señal",
+     options=["B", "A", "A+"], group=grp_flt,
+     tooltip="Filtra señales por calidad del setup.\nB: toma B, A y A+ (comportamiento actual)\nA: solo A y A+ — elimina setups débiles\nA+: solo los mejores setups — muy selectivo\n\nRecomendación: empezar en A para ver impacto en BT\nComparar WR y PnL vs B para decidir.")
+i_max_vol_atr   = input.float(300.0, "Volatilidad máxima (pts ATR sesión)",
+     group=grp_flt, minval=50.0, step=25.0,
+     tooltip="Filtra días con volatilidad excesiva para el sistema TF.\nSi el ATR promedio de la sesión supera este umbral → sin señales ese día.\n\nReferencia NQ:\n  Normal:  150-250pts → operar\n  Elevado: 250-300pts → cuidado\n  Extremo: >300pts    → NO operar (Feb-Mar 2026)\n\nValor 0 = filtro desactivado.")
+i_open_blackout = input.int(3,   "Open Blackout (barras 5M tras 9:30)", group=grp_flt, minval=0, maxval=12,
+     tooltip="3 barras 5M = 15 min de blackout tras apertura. Igual que antes.")
+i_close_window  = input.int(18,  "Ventana máxima (barras 5M tras 9:30)", group=grp_flt, minval=6, maxval=36,
+     tooltip="18 barras 5M = 90 min → hasta las 11:00 ET.\nAmpliado vs 1M porque 5M genera menos señales.")
+i_delta_confirm = input.int(1,   "Delta Consistency (of last 3 bars)", group=grp_flt, minval=1, maxval=3)
+i_cvd_exit_pct  = input.float(50.0, "Salida CVD — % degradación", group=grp_flt, minval=10, maxval=100, step=5,
+     tooltip="Si el CVD cae X% respecto al momento de entrada → señal de salida.")
+
+grp_tm          = "── Trade Management ──"
+i_sl_buffer     = input.float(8.0,  "SL Buffer (points)",    group=grp_tm, minval=2.0, maxval=20.0, step=1.0,
+     tooltip="SL = extremo de la vela de señal + buffer.\nLONG: SL = low - buffer\nSHORT: SL = high + buffer\n8 pts = margen mínimo sobre el extremo real de la vela.\nMás chico posible sin quedar dentro del rango de la vela.")
+i_sl_min_pts    = input.float(20.0, "SL mínimo (points)",    group=grp_tm, minval=5.0,  step=5.0,
+     tooltip="Floor de seguridad para velas muy pequeñas.\nSi (extremo + buffer) < mínimo, usa el mínimo.\n20 pts = protección en días extremadamente tranquilos.")
+i_sl_max_pts    = input.float(55.0, "SL máximo (points)",    group=grp_tm, minval=20.0, step=5.0,
+     tooltip="Techo de seguridad. Si (extremo + buffer) > máximo → señal omitida.\nVela 5M muy grande = volatilidad excesiva, no entrar.\n55 pts = techo conservador para apertura NAS100.")
+i_tp1_r         = input.float(1.0,  "TP1 (R)",               group=grp_tm, minval=0.5)
+i_tp2_r         = input.float(2.0,  "TP2 (R)",               group=grp_tm, minval=1.0)
+i_tp3_r         = input.float(3.0,  "TP3 (R)",               group=grp_tm, minval=1.5)
+i_show_levels   = input.bool(true,  "Mostrar labels TP/SL",  group=grp_tm)
+i_show_boxes    = input.bool(true,  "Mostrar boxes TP/SL",   group=grp_tm)
+
+grp_pmt         = "── PickMyTrade ──"
+i_pmt_symbol    = input.string("MNQ1!",               "Símbolo",    group=grp_pmt)
+i_pmt_token     = input.string("YOUR_PMT_TOKEN", "Token",      group=grp_pmt)
+i_pmt_account   = input.string("YOUR_ACCOUNT_ID",             "Account ID", group=grp_pmt)
+i_pmt_risk      = input.float(650.0, "Riesgo total USD ($)",            group=grp_pmt, minval=50.0, step=50.0,
+     tooltip="Riesgo máximo total por trade en dólares.\nSe divide en 2 posiciones iguales.\nQty = (Riesgo/2) / (SL_pts × $2 por punto MNQ)\nEjemplo: $650 total, SL=30pts → qty = 325/(30×2) = 5 MNQ por posición\nMax DD seguro: 3 SL × $650 = $1,950 (dentro del límite Apex de $2,000)")
+
+grp_test        = "── Prueba / Live ──"
+i_force_long    = input.bool(false, "⚡ Forzar señal LONG (test)",  group=grp_test)
+i_force_short   = input.bool(false, "⚡ Forzar señal SHORT (test)", group=grp_test)
+i_reset_test    = input.bool(false, "🔄 Reset test",                group=grp_test)
+
+grp_dash        = "── Dashboards ──"
+i_show_bt       = input.bool(true,  "📊 Mostrar BT / WR",          group=grp_dash,
+     tooltip="Dashboard de backtesting con PnL, WR, Quality Score y contadores acumulados.")
+i_show_log      = input.bool(true,  "📋 Mostrar Trade Log",         group=grp_dash,
+     tooltip="Historial de trades con niveles alcanzados.")
+i_show_setup    = input.bool(true,  "🎯 Mostrar Setup / Trade Activo", group=grp_dash,
+     tooltip="Dashboard de setup potencial y semáforo de continuación en trade activo.")
+i_show_live     = input.bool(true,  "⚡ Mostrar Live Dashboard",    group=grp_dash,
+     tooltip="Dashboard compacto para live trading: dirección, niveles, semáforo, qty y tiempo.")
+i_show_score    = input.bool(true,  "🎯 Mostrar Score Detalle",     group=grp_dash,
+     tooltip="Dashboard con desglose de cada factor del score A+/A/B/C para analizar setups.")
+
+grp_log         = "── Trade Log ──"
+i_log_size      = input.int(15, "Max Trades in Log", group=grp_log, minval=5, maxval=30)
+
+// ─── Colors ───────────────────────────────────────────────────────────────────
+C_PREV_POC = color.new(color.yellow, 0)
+C_PREV_VA  = color.new(color.blue,  40)
+C_CURR_POC = color.new(color.orange, 0)
+C_CURR_VA  = color.new(color.teal,  40)
+C_BULL     = color.new(color.lime,   0)
+C_BEAR     = color.new(color.red,    0)
+C_TP1      = color.new(#00e5a0,     0)
+C_TP2      = color.new(#00e5a0,    30)
+C_TP3      = color.new(#00e5a0,    55)
+C_SL       = color.new(#ff3d5a,     0)
+C_ENTRY    = color.new(#00d4ff,     0)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  HELPERS
+// ═══════════════════════════════════════════════════════════════════════════════
+f_num(v) => not na(v) ? str.tostring(math.round(v, 2)) : "—"
+
+f_vp_levels(vp, va_pct) =>
+    float poc = na
+    float vah = na
+    float val = na
+    if map.size(vp) > 0
+        float max_v   = 0.0
+        int   poc_bkt = 0
+        for [bkt, vol] in vp
+            if vol > max_v
+                max_v   := vol
+                poc_bkt := bkt
+        poc := (float(poc_bkt) + 0.5) * i_vp_bucket_pts
+        float total = 0.0
+        for [bkt, vol] in vp
+            total := total + vol
+        float va_vol  = max_v
+        float target  = total * va_pct / 100.0
+        int   lo_bkt  = poc_bkt
+        int   hi_bkt  = poc_bkt
+        int   safety  = 0
+        while va_vol < target and safety < 500
+            float lo_raw = map.get(vp, lo_bkt - 1)
+            float hi_raw = map.get(vp, hi_bkt + 1)
+            float lo_v   = na(lo_raw) ? 0.0 : lo_raw
+            float hi_v   = na(hi_raw) ? 0.0 : hi_raw
+            if lo_v == 0.0 and hi_v == 0.0
+                break
+            if lo_v >= hi_v
+                lo_bkt := lo_bkt - 1
+                va_vol := va_vol + lo_v
+            else
+                hi_bkt := hi_bkt + 1
+                va_vol := va_vol + hi_v
+            safety := safety + 1
+        val := float(lo_bkt) * i_vp_bucket_pts
+        vah := float(hi_bkt + 1) * i_vp_bucket_pts
+    [poc, vah, val]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SL ESTRUCTURAL — basado en extremo de la vela de señal + buffer
+//  Opción C: el SL más chico posible sin quedar dentro de la estructura
+//  LONG:  SL = low  de la vela actual - i_sl_buffer
+//  SHORT: SL = high de la vela actual + i_sl_buffer
+//  MNQ = $0.50 por punto
+// ═══════════════════════════════════════════════════════════════════════════════
+MNQ_PTS_VALUE = 2.00  // 1 punto MNQ = $2.00 (multiplicador $2 × 1 punto). Tick = $0.50 (0.25 pts × $2)
+
+// SL calculado intrabar — se congela al momento de la señal en entry_sl_pts
+// Para el dashboard pre-señal usamos la estimación de la vela actual
+bar_range    = high - low  // rango de la vela actual
+est_sl_long  = math.round((bar_range / 2.0 + i_sl_buffer) / 0.25) * 0.25  // estimación pre-señal para LONG
+est_sl_short = math.round((bar_range / 2.0 + i_sl_buffer) / 0.25) * 0.25  // estimación pre-señal para SHORT
+
+// dyn_sl es la estimación de display — el SL real se calcula en el momento de entrada
+dyn_sl   = math.max(i_sl_min_pts, math.min(i_sl_max_pts, est_sl_long))
+sl_valid = dyn_sl <= i_sl_max_pts
+
+// Qty estimado en tiempo real para el dashboard
+dyn_qty  = not na(dyn_sl) and dyn_sl > 0 ? math.max(1, math.floor((i_pmt_risk / 2.0) / (dyn_sl * MNQ_PTS_VALUE))) : 1
+
+// Función para calcular el SL estructural al momento exacto de la señal
+// Protección: si close==low (vela sin rango) → usa i_sl_min_pts como fallback
+f_calc_sl(is_long) =>
+    float _raw = is_long ? (close - low + i_sl_buffer) : (high - close + i_sl_buffer)
+    float raw_sl = na(_raw) or _raw <= 0 ? i_sl_min_pts : _raw
+    float clamped = math.max(i_sl_min_pts, math.min(i_sl_max_pts, raw_sl))
+    float rounded = math.round(clamped / 0.25) * 0.25
+    [rounded, rounded <= i_sl_max_pts]
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SESIÓN — conteo en barras 5M
+// ═══════════════════════════════════════════════════════════════════════════════
+is_regular     = not na(time(timeframe.period, "0930-1600", "America/New_York"))
+is_new_session = is_regular and not is_regular[1]
+
+var int session_bar_count = 0
+if is_new_session
+    session_bar_count := 0
+if is_regular and barstate.isconfirmed
+    session_bar_count := session_bar_count + 1
+
+// Blackout: la señal se detecta intrabar cuando count aún no incrementó
+// Por eso usamos count + 1 para anticipar el cierre de la barra actual
+// Ejemplo: blackout=7, barra 7 abierta → count=6, count+1=7 → bloqueado ✓
+int effective_bar = barstate.isconfirmed ? session_bar_count : session_bar_count + 1
+past_blackout = effective_bar >= i_open_blackout
+within_window = effective_bar <= i_close_window
+
+// ─── Opening Range (ORB) — primeras 6 barras de 5M = primeros 30 min ─────────
+var float orb_high = na
+var float orb_low  = na
+var bool  orb_set  = false
+
+if is_new_session
+    orb_high := na
+    orb_low  := na
+    orb_set  := false
+
+if is_regular and session_bar_count <= 6
+    orb_high := na(orb_high) ? high : math.max(orb_high, high)
+    orb_low  := na(orb_low)  ? low  : math.min(orb_low,  low)
+
+if is_regular and session_bar_count == 7 and not orb_set
+    orb_set := true
+
+bool price_above_orb = orb_set and not na(orb_high) and close > orb_high
+bool price_below_orb = orb_set and not na(orb_low)  and close < orb_low
+bool price_in_orb    = orb_set and not na(orb_high) and not na(orb_low) and close >= orb_low and close <= orb_high
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  FILTRO DE VOLATILIDAD INTRADAY
+//  ATR de sesión = promedio del rango de barras desde las 9:30
+//  Si supera i_max_vol_atr → vol_too_high = true → sin señales ese día
+//  Elimina automáticamente días de whipsaw extremo (Feb-Mar 2026)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+var float sess_atr_sum   = 0.0
+var int   sess_atr_count = 0
+
+if is_new_session
+    sess_atr_sum   := 0.0
+    sess_atr_count := 0
+
+if is_regular and barstate.isconfirmed
+    sess_atr_sum   := sess_atr_sum + (high - low)
+    sess_atr_count := sess_atr_count + 1
+
+float sess_atr   = sess_atr_count >= 3 ? sess_atr_sum / float(sess_atr_count) : 0.0
+float recent_vol_3 = is_regular ? math.max(high - low, math.max(high[1] - low[1], high[2] - low[2])) : 0.0
+
+// vol_too_high: ATR promedio supera el umbral O pico reciente supera 1.5× el umbral
+// i_max_vol_atr = 0 → filtro desactivado
+bool vol_too_high = i_max_vol_atr > 0 and is_regular and sess_atr_count >= 3 and
+     (sess_atr > i_max_vol_atr or recent_vol_3 > i_max_vol_atr * 1.5)
+
+var string vol_regime    = "calculando"
+var color  vol_regime_col = color.new(#3a5060, 0)
+if not is_regular or sess_atr_count < 3
+    vol_regime     := "calculando"
+    vol_regime_col := color.new(#3a5060, 0)
+else if sess_atr > i_max_vol_atr
+    vol_regime     := "EXTREMA - bloqueado"
+    vol_regime_col := color.new(#ff3d5a, 0)
+else if sess_atr > i_max_vol_atr * 0.80
+    vol_regime     := "ELEVADA - cuidado"
+    vol_regime_col := color.new(#ff9d00, 0)
+else
+    vol_regime     := "NORMAL"
+    vol_regime_col := color.new(#00e5a0, 0)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  VWAP DIARIO
+//  Reseteado en cada sesión (9:30 ET)
+//  Referencia institucional principal
+// ═══════════════════════════════════════════════════════════════════════════════
+var float vwap_cum_pv = 0.0   // precio × volumen acumulado
+var float vwap_cum_v  = 0.0   // volumen acumulado
+
+if is_new_session
+    vwap_cum_pv := 0.0
+    vwap_cum_v  := 0.0
+
+if is_regular
+    float _typical = (high + low + close) / 3.0
+    vwap_cum_pv := vwap_cum_pv + _typical * volume
+    vwap_cum_v  := vwap_cum_v  + volume
+
+float vwap_daily = vwap_cum_v > 0 ? vwap_cum_pv / vwap_cum_v : na
+
+// Posición del precio vs VWAP
+bool price_above_vwap = not na(vwap_daily) and close > vwap_daily
+bool price_below_vwap = not na(vwap_daily) and close < vwap_daily
+float dist_to_vwap    = not na(vwap_daily) ? math.round(math.abs(close - vwap_daily), 1) : na
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ESTRUCTURA MAYOR — Máximos y mínimos de N sesiones anteriores
+//  Detecta si el precio está cerca de niveles extremos históricos
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Máximos y mínimos de las últimas 10 sesiones (50 barras de 1D aprox en 5M)
+// Usamos request.security para traer datos diarios
+float daily_high  = request.security(syminfo.tickerid, "D", ta.highest(high, 5)[1], lookahead=barmerge.lookahead_on)
+float daily_low   = request.security(syminfo.tickerid, "D", ta.lowest(low,   5)[1], lookahead=barmerge.lookahead_on)
+
+// Distancia del precio actual a esos extremos
+float dist_to_major_high = not na(daily_high) ? math.round(math.abs(close - daily_high), 1) : na
+float dist_to_major_low  = not na(daily_low)  ? math.round(math.abs(close - daily_low),  1) : na
+
+// Umbrales de proximidad (en puntos MNQ)
+float major_threshold = 80.0  // dentro de 80pts = "cerca del extremo"
+float major_very_close = 30.0 // dentro de 30pts = "en el extremo"
+
+// ¿Está cerca de máximos o mínimos?
+bool near_major_high      = not na(dist_to_major_high) and dist_to_major_high <= major_threshold
+bool near_major_low       = not na(dist_to_major_low)  and dist_to_major_low  <= major_threshold
+bool very_near_major_high = not na(dist_to_major_high) and dist_to_major_high <= major_very_close
+bool very_near_major_low  = not na(dist_to_major_low)  and dist_to_major_low  <= major_very_close
+
+// Clasificación de estructura mayor para LONG y SHORT
+// LONG cerca de máximos = malo (resistencia histórica)
+// SHORT cerca de mínimos = malo (soporte histórico)
+string struct_long  = very_near_major_high ? "C — en máximos hist." : near_major_high ? "B — cerca máximos" : near_major_low ? "A — cerca soporte" : "A+ — zona libre"
+string struct_short = very_near_major_low  ? "C — en mínimos hist." : near_major_low  ? "B — cerca mínimos" : near_major_high ? "A — cerca resist." : "A+ — zona libre"
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SESGO DE PERÍODO — Estructura diaria y semanal
+//  3 factores: SMA20 diaria | SMA5>SMA20 | semana anterior
+//  Score: -3 (muy bajista) → 0 (neutro) → +3 (muy alcista)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Datos diarios/semanales — lookahead_on evita repaint
+float d_close      = request.security(syminfo.tickerid, "D", close[1],           lookahead=barmerge.lookahead_on)
+float d_sma20      = request.security(syminfo.tickerid, "D", ta.sma(close, 20)[1], lookahead=barmerge.lookahead_on)
+float d_sma5       = request.security(syminfo.tickerid, "D", ta.sma(close, 5)[1],  lookahead=barmerge.lookahead_on)
+float w_close      = request.security(syminfo.tickerid, "W", close[1],           lookahead=barmerge.lookahead_on)
+float w_open       = request.security(syminfo.tickerid, "W", open[1],            lookahead=barmerge.lookahead_on)
+
+// Factor 1: Cierre diario sobre SMA20 (tendencia estructural)
+bool bias_f1_bull  = not na(d_close) and not na(d_sma20) and d_close > d_sma20
+bool bias_f1_bear  = not na(d_close) and not na(d_sma20) and d_close < d_sma20
+
+// Factor 2: SMA5 > SMA20 (momentum de corto plazo)
+bool bias_f2_bull  = not na(d_sma5) and not na(d_sma20) and d_sma5 > d_sma20
+bool bias_f2_bear  = not na(d_sma5) and not na(d_sma20) and d_sma5 < d_sma20
+
+// Factor 3: Semana anterior cerró verde (flujo institucional semanal)
+bool bias_f3_bull  = not na(w_close) and not na(w_open) and w_close > w_open
+bool bias_f3_bear  = not na(w_close) and not na(w_open) and w_close < w_open
+
+// Score total: -3 a +3
+int bias_bull_count   = (bias_f1_bull ? 1 : 0) + (bias_f2_bull ? 1 : 0) + (bias_f3_bull ? 1 : 0)
+int bias_bear_count   = (bias_f1_bear ? 1 : 0) + (bias_f2_bear ? 1 : 0) + (bias_f3_bear ? 1 : 0)
+int period_bias_score = bias_bull_count - bias_bear_count
+
+// Clasificación
+bool period_bias_bull    = period_bias_score >= i_bias_strength
+bool period_bias_bear    = period_bias_score <= -i_bias_strength
+bool period_bias_neutral = not period_bias_bull and not period_bias_bear
+
+string period_bias_str    = period_bias_bull ? "🟢 ALCISTA" : period_bias_bear ? "🔴 BAJISTA" : "🟡 NEUTRO"
+color  period_bias_col    = period_bias_bull ? color.new(#00e5a0, 0) : period_bias_bear ? color.new(#ff3d5a, 0) : color.new(#ff9d00, 0)
+string period_bias_detail = "D:" + (bias_f1_bull ? "↑" : "↓") + " M:" + (bias_f2_bull ? "↑" : "↓") + " W:" + (bias_f3_bull ? "↑" : "↓")
+
+// Dirección efectiva: automático + manual combinados
+string effective_dir =
+     not i_bias_auto  ? i_dir_filter   :
+     period_bias_bull ? "Solo LONG"    :
+     period_bias_bear ? "Solo SHORT"   :
+     i_dir_filter
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  DETECCIÓN DE RÉGIMEN — Tendencia vs Rango
+//  Usa 3 métricas simples para clasificar el tipo de día
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Métrica 1: Pendiente del VWAP
+// Si el VWAP sube consistentemente → tendencia alcista
+// Si el VWAP baja consistentemente → tendencia bajista
+// Si el VWAP es horizontal → rango
+var float vwap_5bars_ago = na
+if session_bar_count == 5
+    vwap_5bars_ago := vwap_daily
+if is_new_session
+    vwap_5bars_ago := na
+
+float vwap_slope = not na(vwap_5bars_ago) and not na(vwap_daily) ? vwap_daily - vwap_5bars_ago : na
+bool vwap_trending_up   = not na(vwap_slope) and vwap_slope > 5.0   // VWAP subió > 5pts en 5 barras
+bool vwap_trending_down = not na(vwap_slope) and vwap_slope < -5.0  // VWAP bajó > 5pts en 5 barras
+bool vwap_flat          = not na(vwap_slope) and math.abs(vwap_slope) <= 5.0
+
+// Métrica 2: Distancia del precio al VWAP
+// En tendencia: precio se aleja del VWAP
+// En rango: precio oscila cerca del VWAP
+bool price_far_from_vwap = not na(dist_to_vwap) and dist_to_vwap > 30.0  // > 30pts del VWAP
+bool price_near_vwap     = not na(dist_to_vwap) and dist_to_vwap <= 15.0 // cerca del VWAP
+
+// Métrica 3: ¿El precio está del mismo lado del VWAP hace 5 barras?
+// En tendencia: precio siempre sobre (o bajo) el VWAP
+// En rango: precio cruza el VWAP frecuentemente
+var int vwap_cross_count = 0
+var bool prev_above_vwap = false
+if is_new_session
+    vwap_cross_count := 0
+    prev_above_vwap  := false
+if is_regular and barstate.isconfirmed and not na(vwap_daily)
+    if prev_above_vwap != price_above_vwap and session_bar_count > 1
+        vwap_cross_count := vwap_cross_count + 1
+    prev_above_vwap := price_above_vwap
+
+bool few_crossings  = vwap_cross_count <= 1   // pocos cruces = tendencia
+bool many_crossings = vwap_cross_count >= 3   // muchos cruces = rango
+
+// Clasificación final del régimen
+// Solo aplica después de 6 barras (10:00 ET) — datos suficientes
+// Antes de 6 barras → "ESPERAR" para no clasificar con datos insuficientes
+bool regime_ready = session_bar_count >= 6
+
+int regime_score_trend = regime_ready ? ((vwap_trending_up or vwap_trending_down ? 1 : 0) + (price_far_from_vwap ? 1 : 0) + (few_crossings ? 1 : 0)) : 0
+int regime_score_range = regime_ready ? ((vwap_flat ? 1 : 0) + (price_near_vwap ? 1 : 0) + (many_crossings ? 1 : 0)) : 0
+
+string regime_type  = not regime_ready ? "⏳ esperar (< 6 barras)" : regime_score_trend >= 2 ? "📈 TENDENCIA" : regime_score_range >= 2 ? "↔ RANGO" : "~ MIXTO"
+color  regime_color = not regime_ready ? color.new(#3a5060, 0) : regime_score_trend >= 2 ? color.new(#00e5a0, 0) : regime_score_range >= 2 ? color.new(#ff9d00, 0) : color.new(#00d4ff, 0)
+
+// Recomendación de modo según régimen
+string regime_mode_rec = not regime_ready ? "esperar datos" : regime_score_trend >= 2 ? "TF ✓  MR ✗" : regime_score_range >= 2 ? "TF ~  MR ✓" : "TF ✓  MR ~"
+
+// Reglas del runner adaptadas al régimen
+// TENDENCIA: más agresivo — dejar correr más tiempo
+// RANGO:     más conservador — cerrar antes
+// MIXTO:     comportamiento estándar
+bool regime_trend = regime_ready and regime_score_trend >= 2
+bool regime_range = regime_ready and regime_score_range >= 2
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  DELTA POR VELA & CVD
+// ═══════════════════════════════════════════════════════════════════════════════
+bar_delta = high != low ? volume * (2.0 * (close - low) / (high - low) - 1.0) : 0.0
+
+var float cvd = 0.0
+cvd := i_cvd_reset and is_new_session ? bar_delta : cvd + bar_delta
+
+delta_pct  = volume > 0 ? math.abs(bar_delta) / volume * 100.0 : 0.0
+bull_delta = bar_delta > 0 and delta_pct >= i_delta_thresh
+bear_delta = bar_delta < 0 and delta_pct >= i_delta_thresh
+
+// ─── CVD % del rango diario ───────────────────────────────────────────────────
+// Mide la convicción del CVD relativa al rango máximo del día
+// CVD bajo (< 25%) = poca convicción = riesgo de reversión en 0.5R
+// CVD alto (> 50%) = convicción fuerte = más probable continuación
+var float cvd_session_max = 0.0   // máximo absoluto del CVD en la sesión
+var float cvd_session_min = 0.0   // mínimo absoluto del CVD en la sesión
+
+if is_new_session
+    cvd_session_max := 0.0
+    cvd_session_min := 0.0
+
+if is_regular
+    if cvd > cvd_session_max
+        cvd_session_max := cvd
+    if cvd < cvd_session_min
+        cvd_session_min := cvd
+
+// Rango total del CVD en la sesión
+float cvd_session_range = cvd_session_max - cvd_session_min
+// % actual del CVD dentro del rango (0% = mínimo, 100% = máximo)
+float cvd_pct_of_range  = cvd_session_range > 0 ? math.round(math.abs(cvd) / math.max(math.abs(cvd_session_max), math.abs(cvd_session_min)) * 100) : 0.0
+
+// Clasificación de convicción
+bool cvd_strong  = cvd_pct_of_range >= 40   // convicción alta
+bool cvd_medium  = cvd_pct_of_range >= 25 and cvd_pct_of_range < 50  // convicción media
+bool cvd_weak    = cvd_pct_of_range < 25    // convicción baja — riesgo de reversión
+
+f_is_bull_bar(offset) =>
+    d   = high[offset] != low[offset] ? volume[offset] * (2.0 * (close[offset] - low[offset]) / (high[offset] - low[offset]) - 1.0) : 0.0
+    pct = volume[offset] > 0 ? math.abs(d) / volume[offset] * 100.0 : 0.0
+    d > 0 and pct >= i_delta_thresh
+
+f_is_bear_bar(offset) =>
+    d   = high[offset] != low[offset] ? volume[offset] * (2.0 * (close[offset] - low[offset]) / (high[offset] - low[offset]) - 1.0) : 0.0
+    pct = volume[offset] > 0 ? math.abs(d) / volume[offset] * 100.0 : 0.0
+    d < 0 and pct >= i_delta_thresh
+
+bull_prev_count = (f_is_bull_bar(1) ? 1 : 0) + (f_is_bull_bar(2) ? 1 : 0) + (f_is_bull_bar(3) ? 1 : 0)
+bear_prev_count = (f_is_bear_bar(1) ? 1 : 0) + (f_is_bear_bar(2) ? 1 : 0) + (f_is_bear_bar(3) ? 1 : 0)
+
+delta_consistent_bull = bull_prev_count >= i_delta_confirm
+delta_consistent_bear = bear_prev_count >= i_delta_confirm
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  DIVERGENCIA
+//  En 5M lookback=10 ≈ 50 min — suficiente para capturar estructura de sesión
+// ═══════════════════════════════════════════════════════════════════════════════
+lb          = i_div_lookback
+enough_bars = is_regular and session_bar_count >= lb
+bull_div    = enough_bars and low  <= ta.lowest(low,  lb) and cvd > ta.lowest(cvd, lb)
+bear_div    = enough_bars and high >= ta.highest(high, lb) and cvd < ta.highest(cvd, lb)
+
+cvd_rising_sustained  = cvd > cvd[1] and cvd[1] > cvd[3]
+cvd_falling_sustained = cvd < cvd[1] and cvd[1] < cvd[3]
+
+bull_delta_sustained = bull_delta and f_is_bull_bar(1)
+bear_delta_sustained = bear_delta and f_is_bear_bar(1)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  VOLUME PROFILE
+// ═══════════════════════════════════════════════════════════════════════════════
+var map<int, float> curr_vp = map.new<int, float>()
+var map<int, float> prev_vp = map.new<int, float>()
+
+var float prev_poc = na
+var float prev_vah = na
+var float prev_val = na
+var float curr_poc = na
+var float curr_vah = na
+var float curr_val = na
+var int   sess_bar = na
+
+if is_new_session and map.size(curr_vp) > 0
+    map.clear(prev_vp)
+    for [k, v] in curr_vp
+        map.put(prev_vp, k, v)
+    [pp, ph, pl] = f_vp_levels(prev_vp, i_va_pct)
+    prev_poc := pp
+    prev_vah := ph
+    prev_val := pl
+    map.clear(curr_vp)
+    sess_bar := bar_index
+
+if is_regular
+    if na(sess_bar)
+        sess_bar := bar_index
+    mid = (high + low) / 2.0
+    bkt = int(math.floor(mid / i_vp_bucket_pts))
+    ex  = map.get(curr_vp, bkt)
+    map.put(curr_vp, bkt, na(ex) ? volume : ex + volume)
+    if map.size(curr_vp) >= 3
+        [cp, ch, cl] = f_vp_levels(curr_vp, i_va_pct)
+        curr_poc := cp
+        curr_vah := ch
+        curr_val := cl
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  MODO OPERATIVO
+// ═══════════════════════════════════════════════════════════════════════════════
+in_prev_va    = not na(prev_val) and not na(prev_vah) and close >= prev_val and close <= prev_vah
+above_prev_va = not na(prev_vah) and close[1] > prev_vah
+below_prev_va = not na(prev_val) and close[1] < prev_val
+mode_mr = in_prev_va
+mode_tf = not in_prev_va
+
+//  CLASIFICACIÓN DEL SETUP — A+, A, B, C
+//  7 factores usados por traders institucionales
+//  Score máximo: +14 | Score mínimo: -14
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Factor 1: VWAP (peso: ±2)
+// El nivel institucional más importante del día
+// LONG sobre VWAP lejos = +2, cerca = +1, bajo VWAP = -1
+f_vwap_score(is_long) =>
+    if na(vwap_daily)
+        0
+    else if is_long
+        if price_above_vwap
+            dist_to_vwap > 20 ? 2 : 1
+        else
+            -1
+    else
+        if price_below_vwap
+            dist_to_vwap > 20 ? 2 : 1
+        else
+            -1
+
+// Factor 2: Estructura mayor — máximos/mínimos históricos (peso: ±2)
+// Comprar en máximos históricos = C directo (-2)
+f_struct_score(is_long) =>
+    if is_long
+        if very_near_major_high
+            -2
+        else if near_major_high
+            -1
+        else if near_major_low
+            1
+        else
+            2
+    else
+        if very_near_major_low
+            -2
+        else if near_major_low
+            -1
+        else if near_major_high
+            1
+        else
+            2
+
+// Factor 3: ORB — Opening Range Breakout (peso: ±2)
+// Señal en dirección del ORB breakout = fuerte
+// Señal dentro del ORB = débil
+// Señal contra el ORB = negativo
+f_orb_score(is_long) =>
+    if not orb_set
+        0  // ORB no confirmado aún (primeros 30 min)
+    else if is_long
+        if price_above_orb
+            2   // LONG sobre ORB High = A+
+        else if price_in_orb
+            -2  // LONG dentro del rango = sin dirección clara
+        else
+            -2  // LONG bajo ORB Low = contra la dirección del día
+    else
+        if price_below_orb
+            2   // SHORT bajo ORB Low = A+
+        else if price_in_orb
+            -2  // SHORT dentro del rango = sin dirección clara
+        else
+            -2
+
+// Factor 4: PREV POC — Punto de Control anterior (peso: ±1)
+// El POC del día anterior es imán — precio encima/debajo define sesgo
+f_poc_score(is_long) =>
+    if na(prev_poc)
+        0
+    else if is_long
+        if close > prev_poc
+            1  // sobre POC anterior = sesgo alcista
+        else
+            -1  // bajo POC anterior = sesgo bajista
+    else
+        if close < prev_poc
+            1
+        else
+            -1
+
+// Factor 5: Régimen del día (peso: ±2)
+// TENDENCIA alcista = bueno para LONG, malo para SHORT
+// TENDENCIA bajista no se detecta aún (solo alcista/rango)
+// Para SHORT en TENDENCIA: penalizar porque va contra el momentum
+f_regime_score(is_long) =>
+    if not regime_ready
+        0
+    else if regime_trend
+        if is_long
+            2   // LONG en tendencia alcista → perfecto
+        else
+            -1  // SHORT en tendencia alcista → riesgoso
+    else if regime_range
+        if is_long
+            -1  // LONG en rango → señal débil
+        else
+            1   // SHORT en rango → más favorable (MR)
+    else
+        1  // MIXTO → ligero favor a ambos
+
+// Factor 6: CVD convicción al momento de la señal (peso: ±2)
+// CVD fuerte alcista = bueno para LONG, malo para SHORT
+// CVD fuerte bajista = bueno para SHORT, malo para LONG
+f_cvd_score(is_long) =>
+    bool _cvd_favor  = is_long ? cvd_rising_sustained : cvd_falling_sustained
+    bool _cvd_contra = is_long ? cvd_falling_sustained : cvd_rising_sustained
+    if cvd_strong
+        if _cvd_favor
+            2   // CVD fuerte a favor
+        else if _cvd_contra
+            -2  // CVD fuerte en contra — señal muy negativa
+        else
+            1   // CVD fuerte pero neutral en dirección
+    else if cvd_medium
+        if _cvd_favor
+            1
+        else if _cvd_contra
+            -1
+        else
+            0
+    else if cvd_weak
+        -1  // CVD débil = poca convicción
+    else
+        0
+
+// Factor 7: Vela de señal — calidad de la entrada (peso: ±2)
+f_candle_score() =>
+    float _b = math.abs(close - open)
+    float _r = high - low
+    float _ratio = _r > 0 ? _b / _r : 0.0
+    if _ratio >= 0.7
+        2
+    else if _ratio >= 0.5
+        1
+    else if _ratio >= 0.3
+        0
+    else
+        -1
+
+// Score total — máximo posible: +13
+setup_total_score(is_long) =>
+    f_vwap_score(is_long) + f_struct_score(is_long) + f_orb_score(is_long) + f_poc_score(is_long) + f_regime_score(is_long) + f_cvd_score(is_long) + f_candle_score()
+
+// Clasificación — score máximo es +13
+// A+: 9-13 (mayoría fuerte a favor) — requiere ORB confirmado y favorable
+// A:  5-8  (mayoría a favor)
+// B:  1-4  (mixto, con sesgo)
+// C:  0 o menos (en contra o sin ventaja)
+// Regla especial: si ORB es negativo → máximo A (nunca A+)
+f_setup_grade(score) =>
+    if score >= 9
+        "A+"
+    else if score >= 5
+        "A"
+    else if score >= 1
+        "B"
+    else
+        "C"
+
+// Aplicar regla ORB: degradar A+ a A si ORB no está a favor
+f_apply_orb_cap(grade, is_long) =>
+    if grade == "A+" and orb_set
+        bool _orb_ok = is_long ? price_above_orb : price_below_orb
+        if not _orb_ok
+            "A"  // ORB en contra o dentro → degradar a A
+        else
+            "A+"
+    else
+        grade
+
+f_setup_color(grade) =>
+    if grade == "A+"
+        color.new(#00e5a0, 0)
+    else if grade == "A"
+        color.new(#00d4ff, 0)
+    else if grade == "B"
+        color.new(#ff9d00, 0)
+    else
+        color.new(#ff3d5a, 0)
+
+f_setup_risk(grade) =>
+    if grade == "A+"
+        "100% — $" + str.tostring(math.round(i_pmt_risk))
+    else if grade == "A"
+        "75%  — $" + str.tostring(math.round(i_pmt_risk * 0.75))
+    else if grade == "B"
+        "50%  — $" + str.tostring(math.round(i_pmt_risk * 0.50))
+    else
+        "0%   — NO tomar"
+
+// Calcular para LONG y SHORT potenciales
+float _setup_score_long  = setup_total_score(true)
+float _setup_score_short = setup_total_score(false)
+string _grade_long  = f_apply_orb_cap(f_setup_grade(_setup_score_long),  true)
+string _grade_short = f_apply_orb_cap(f_setup_grade(_setup_score_short), false)
+
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CONDICIONES DE ENTRADA
+//  TF usa close[1] > prev_vah — vela 5M YA cerrada encima del VAH
+//  Esto elimina el problema de spikes intrabar que no confirman al cierre
+// ═══════════════════════════════════════════════════════════════════════════════
+prox     = dyn_sl * 3.0
+near_val = not na(prev_val) and low  <= prev_val + prox
+near_vah = not na(prev_vah) and high >= prev_vah - prox
+
+// TF: confirmación basada en cierre de barra anterior (ya confirmada)
+above_prev_va_confirmed = not na(prev_vah) and close[1] > prev_vah
+below_prev_va_confirmed = not na(prev_val) and close[1] < prev_val
+
+cvd_rising_sustained_tf  = cvd > cvd[1] and cvd[1] > cvd[3]
+cvd_falling_sustained_tf = cvd < cvd[1] and cvd[1] < cvd[3]
+
+// i_enable_mr / i_enable_tf — toggles para BT selectivo
+long_mr  = i_enable_mr and mode_mr and near_val and bull_div and bull_delta_sustained and past_blackout and within_window and delta_consistent_bull and cvd_rising_sustained  and not bear_div[1] and sl_valid
+short_mr = i_enable_mr and mode_mr and near_vah and bear_div and bear_delta_sustained and past_blackout and within_window and delta_consistent_bear and cvd_falling_sustained and not bull_div[1] and sl_valid
+
+// TF: above_prev_va_confirmed usa close[1] — la vela 5M anterior YA cerró encima del VAH
+// No hay posibilidad de spike intrabar — la confirmación ocurrió en barra pasada
+long_tf  = i_enable_tf and mode_tf and above_prev_va_confirmed and cvd_rising_sustained_tf  and bull_delta_sustained and past_blackout and within_window and delta_consistent_bull and not bear_div[1] and sl_valid
+short_tf = i_enable_tf and mode_tf and below_prev_va_confirmed and cvd_falling_sustained_tf and bear_delta_sustained and past_blackout and within_window and delta_consistent_bear and not bull_div[1] and sl_valid
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  FILTRO DE GRADE MÍNIMO
+//  Filtra señales que no alcanzan el grade mínimo configurado
+//  Objetivo: eliminar SL Tipo B (mercado rechaza la dirección)
+//  B = toma todo | A = filtra débiles | A+ = solo los mejores
+// ═══════════════════════════════════════════════════════════════════════════════
+f_grade_ok(grade) =>
+    if i_min_grade == "A+"
+        grade == "A+"
+    else if i_min_grade == "A"
+        grade == "A+" or grade == "A"
+    else
+        grade == "A+" or grade == "A" or grade == "B"
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  CONTROL DE FRECUENCIA
+// ═══════════════════════════════════════════════════════════════════════════════
+var int  sig_count  = 0
+var int  lock_bar   = -9999
+var bool sig_locked = false
+
+if sig_locked and (bar_index - lock_bar) >= i_cooldown_bars
+    sig_locked := false
+if is_new_session
+    sig_count  := 0
+    lock_bar   := -9999
+    sig_locked := false
+
+freq_ok   = not sig_locked and sig_count < i_max_signals
+
+raw_long  = is_regular and (long_mr  or long_tf)
+raw_short = is_regular and (short_mr or short_tf)
+// ── Filtro de dirección ────────────────────────────────────────────────────
+// Permite restringir el sistema a solo LONG, solo SHORT, o ambas
+// Útil cuando el sesgo macro del día está claramente confirmado
+// Solo LONG:  bloquea todas las señales SHORT
+// Solo SHORT: bloquea todas las señales LONG
+dir_allow_long  = effective_dir != "Solo SHORT"
+dir_allow_short = effective_dir != "Solo LONG"
+
+// Grade calculado inline para el filtro — mismo cálculo que en el score dashboard
+// Nota: _grade_long/_grade_short se declaran más abajo (L849) junto al score dashboard
+// Aquí recalculamos inline para poder filtrar antes de generar la señal
+_sig_score_long  = setup_total_score(true)
+_sig_score_short = setup_total_score(false)
+_sig_grade_long  = f_apply_orb_cap(f_setup_grade(_sig_score_long),  true)
+_sig_grade_short = f_apply_orb_cap(f_setup_grade(_sig_score_short), false)
+
+// vol_too_high bloquea señales en días de volatilidad extrema (Feb-Mar 2026)
+long_sig  = raw_long  and freq_ok and dir_allow_long  and f_grade_ok(_sig_grade_long)  and not vol_too_high
+short_sig = raw_short and freq_ok and not raw_long and dir_allow_short and f_grade_ok(_sig_grade_short) and not vol_too_high
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  PICKMYTRADE JSON
+//  Orden 1: TP en 0.5R automático | Orden 2: runner sin TP (cierre manual)
+// ═══════════════════════════════════════════════════════════════════════════════
+// ─── Función de qty calculado ─────────────────────────────────────────────────
+// Riesgo total / 2 posiciones = riesgo por posición
+// qty = riesgo_por_posicion / (SL_pts × $2 por punto MNQ)
+// Mínimo 1 contrato, redondeado hacia abajo para no exceder el riesgo
+f_qty(sl_pts) =>
+    float _risk_per_pos = i_pmt_risk / 2.0
+    math.max(1, math.floor(_risk_per_pos / (sl_pts * MNQ_PTS_VALUE)))
+
+// Orden 1: parcial con TP en 0.5R
+of_pmt_partial(action, sl_price, tp05_price, sl_pts) =>
+    int _qty = f_qty(sl_pts)
+    '{"symbol":"'        + i_pmt_symbol  + '",'
+     + '"date":"'        + str.tostring(timenow) + '",'
+     + '"data":"'        + action        + '",'
+     + '"quantity":"'    + str.tostring(_qty) + '",'
+     + '"risk_percentage":0,'
+     + '"price":"'       + str.tostring(close, "#.##") + '",'
+     + '"tp":'           + str.tostring(tp05_price, "#.##") + ','
+     + '"percentage_tp":0,"dollar_tp":0,'
+     + '"sl":'           + str.tostring(sl_price, "#.##") + ','
+     + '"dollar_sl":0,"percentage_sl":0,'
+     + '"trail":0,"trail_stop":0,"trail_trigger":0,"trail_freq":0,'
+     + '"update_tp":false,"update_sl":false,'
+     + '"breakeven":0,"breakeven_offset":0,'
+     + '"token":"'       + i_pmt_token  + '",'
+     + '"pyramid":true,"same_direction_ignore":false,"reverse_order_close":false,'
+     + '"multiple_accounts":[{"token":"' + i_pmt_token + '","account_id":"' + i_pmt_account + '","risk_percentage":0,"quantity_multiplier":1}]}'
+
+// Orden 2: runner con TP de seguridad en 3R
+// Si no cierras manualmente, Tradovate cierra automáticamente en 3R
+of_pmt_runner(action, sl_price, tp3_price, sl_pts) =>
+    int _qty = f_qty(sl_pts)
+    '{"symbol":"'        + i_pmt_symbol  + '",'
+     + '"date":"'        + str.tostring(timenow) + '",'
+     + '"data":"'        + action        + '",'
+     + '"quantity":"'    + str.tostring(_qty) + '",'
+     + '"risk_percentage":0,'
+     + '"price":"'       + str.tostring(close, "#.##") + '",'
+     + '"tp":'           + str.tostring(tp3_price, "#.##") + ','
+     + '"percentage_tp":0,"dollar_tp":0,'
+     + '"sl":'           + str.tostring(sl_price, "#.##") + ','
+     + '"dollar_sl":0,"percentage_sl":0,'
+     + '"trail":0,"trail_stop":0,"trail_trigger":0,"trail_freq":0,'
+     + '"update_tp":false,"update_sl":false,'
+     + '"breakeven":0,"breakeven_offset":0,'
+     + '"token":"'       + i_pmt_token  + '",'
+     + '"pyramid":true,"same_direction_ignore":false,"reverse_order_close":false,'
+     + '"multiple_accounts":[{"token":"' + i_pmt_token + '","account_id":"' + i_pmt_account + '","risk_percentage":0,"quantity_multiplier":1}]}'
+
+of_pmt_json(action, sl_price, tp_price, sl_pts) =>
+    int _qty = f_qty(sl_pts)
+    '{"symbol":"'        + i_pmt_symbol  + '",'
+     + '"date":"'        + str.tostring(timenow) + '",'
+     + '"data":"'        + action        + '",'
+     + '"quantity":"'    + str.tostring(_qty) + '",'
+     + '"risk_percentage":0,'
+     + '"price":"'       + str.tostring(close, "#.##") + '",'
+     + '"tp":'           + str.tostring(tp_price, "#.##") + ','
+     + '"percentage_tp":0,"dollar_tp":0,'
+     + '"sl":'           + str.tostring(sl_price, "#.##") + ','
+     + '"dollar_sl":0,"percentage_sl":0,'
+     + '"trail":0,"trail_stop":0,"trail_trigger":0,"trail_freq":0,'
+     + '"update_tp":false,"update_sl":false,'
+     + '"breakeven":0,"breakeven_offset":0,'
+     + '"token":"'       + i_pmt_token  + '",'
+     + '"pyramid":true,"same_direction_ignore":false,"reverse_order_close":false,'
+     + '"multiple_accounts":[{"token":"' + i_pmt_token + '","account_id":"' + i_pmt_account + '","risk_percentage":0,"quantity_multiplier":1}]}'
+
+// ─── Test signals ─────────────────────────────────────────────────────────────
+// La alerta se envía al CIERRE de barra detectando cambio de bar_index
+// bar_index cambia solo cuando abre una nueva barra = cierre de la anterior
+// El visual se dibuja en barstate.islast (último tick de la barra actual)
+var bool test_fired    = false
+var int  test_bar_sent = -1   // bar_index donde se envió la alerta de test
+
+if i_reset_test
+    test_fired    := false
+    test_bar_sent := -1
+
+// Visual: solo en la última barra, una sola vez
+bool test_long_sig  = i_force_long  and not i_reset_test and not test_fired and barstate.islast
+bool test_short_sig = i_force_short and not i_reset_test and not test_fired and not i_force_long and barstate.islast
+
+// Alerta: solo cuando cambia el bar_index (= inicio de nueva barra = cierre de la anterior)
+// bar_index != bar_index[1] es true solo en el PRIMER tick de cada nueva barra
+bool test_alert_long  = i_force_long  and not i_reset_test and not test_fired and bar_index != bar_index[1] and barstate.isrealtime
+bool test_alert_short = i_force_short and not i_reset_test and not test_fired and not i_force_long and bar_index != bar_index[1] and barstate.isrealtime
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  GUARDIA DE ALERTA — freq_all + guardia int
+//  Garantiza un solo envío por barra, sin delay
+//  Reset en new_session para no bloquear el primer trade del día siguiente
+// ═══════════════════════════════════════════════════════════════════════════════
+var int alert_sent_on_bar = -1
+
+if is_new_session
+    alert_sent_on_bar := -1
+
+// ═══════════════════════════════════════════════════════════════════════════════
+
+
+// ─── Captura de entrada ────────────────────────────────────────────────────────
+// La alerta se envía con freq_once_per_bar_close — TradingView garantiza
+// que solo se ejecuta al cierre de la barra, sin múltiples envíos intrabar
+// La guardia alert_sent_on_bar es backup adicional contra duplicados
+var float  entry_price  = na
+var float  entry_cvd    = na
+var string entry_dir    = "—"
+var string entry_mode   = "—"
+var float  entry_sl     = na
+var float  entry_tp1    = na
+var float  entry_tp2    = na
+var float  entry_tp3    = na
+var float  entry_sl_pts    = na
+var float  entry_setup_score = na   // score congelado al momento de la entrada
+var string entry_setup_grade = "—"  // grade congelado al momento de la entrada
+var int    entry_s_vwap    = 0      // factores congelados individualmente
+var int    entry_s_struct  = 0
+var int    entry_s_orb     = 0
+var int    entry_s_poc     = 0
+var int    entry_s_regime  = 0
+var int    entry_s_cvd     = 0
+var int    entry_s_candle  = 0
+
+if (long_sig and not sig_locked) or (test_long_sig and not test_fired)
+    [_sl_pts, _sl_ok] = f_calc_sl(true)
+    entry_price        := close
+    entry_cvd          := cvd
+    entry_dir          := "LONG"
+    entry_mode         := long_mr ? "MR" : "TF"
+    entry_sl_pts       := _sl_pts
+    entry_sl           := close - _sl_pts
+    entry_tp1          := close + _sl_pts * i_tp1_r
+    entry_tp2          := close + _sl_pts * i_tp2_r
+    entry_tp3          := close + _sl_pts * i_tp3_r
+    // Congelar score al momento exacto de la señal
+    entry_setup_score  := _setup_score_long
+    entry_setup_grade  := f_apply_orb_cap(_grade_long, true)
+    entry_s_vwap       := f_vwap_score(true)
+    entry_s_struct     := f_struct_score(true)
+    entry_s_orb        := f_orb_score(true)
+    entry_s_poc        := f_poc_score(true)
+    entry_s_regime     := f_regime_score(true)
+    entry_s_cvd        := f_cvd_score(true)
+    entry_s_candle     := f_candle_score()
+    sig_count          := sig_count + 1
+    lock_bar           := bar_index
+    sig_locked         := true
+    if test_long_sig
+        test_fired := true
+    if alert_sent_on_bar != bar_index
+        alert_sent_on_bar := bar_index
+        alert(of_pmt_partial("buy", close - _sl_pts, close + _sl_pts * 0.5, _sl_pts), alert.freq_once_per_bar_close)
+        alert(of_pmt_runner("buy",  close - _sl_pts, close + _sl_pts * i_tp3_r, _sl_pts), alert.freq_once_per_bar_close)
+
+if (short_sig and not sig_locked) or (test_short_sig and not test_fired)
+    [_sl_pts, _sl_ok] = f_calc_sl(false)
+    entry_price        := close
+    entry_cvd          := cvd
+    entry_dir          := "SHORT"
+    entry_mode         := short_mr ? "MR" : "TF"
+    entry_sl_pts       := _sl_pts
+    entry_sl           := close + _sl_pts
+    entry_tp1          := close - _sl_pts * i_tp1_r
+    entry_tp2          := close - _sl_pts * i_tp2_r
+    entry_tp3          := close - _sl_pts * i_tp3_r
+    // Congelar score al momento exacto de la señal
+    entry_setup_score  := _setup_score_short
+    entry_setup_grade  := f_apply_orb_cap(_grade_short, false)
+    entry_s_vwap       := f_vwap_score(false)
+    entry_s_struct     := f_struct_score(false)
+    entry_s_orb        := f_orb_score(false)
+    entry_s_poc        := f_poc_score(false)
+    entry_s_regime     := f_regime_score(true)
+    entry_s_cvd        := f_cvd_score(true)
+    entry_s_candle     := f_candle_score()
+    sig_count          := sig_count + 1
+    lock_bar           := bar_index
+    sig_locked         := true
+    if test_short_sig
+        test_fired := true
+    if alert_sent_on_bar != bar_index
+        alert_sent_on_bar := bar_index
+        alert(of_pmt_partial("sell", close + _sl_pts, close - _sl_pts * 0.5, _sl_pts), alert.freq_once_per_bar_close)
+        alert(of_pmt_runner("sell",  close + _sl_pts, close - _sl_pts * i_tp3_r, _sl_pts), alert.freq_once_per_bar_close)
+
+if is_new_session
+    entry_price   := na
+    entry_cvd     := na
+    entry_dir     := "—"
+    entry_mode    := "—"
+    entry_sl      := na
+    entry_tp1     := na
+    entry_tp2     := na
+    entry_tp3     := na
+    entry_sl_pts  := na
+
+// ─── Flag intrabar ────────────────────────────────────────────────────────────
+var bool   trk_has_long  = false
+var bool   trk_has_short = false
+var string trk_mode      = "—"
+var int    trk_bar       = -1
+
+if bar_index != trk_bar and trk_bar != -1
+    trk_has_long  := false
+    trk_has_short := false
+    trk_mode      := "—"
+
+if long_sig or test_long_sig
+    trk_has_long := true
+    trk_mode     := long_mr ? "MR" : "TF"
+    trk_bar      := bar_index
+
+if (short_sig or test_short_sig) and not raw_long
+    trk_has_short := true
+    trk_mode      := short_mr ? "MR" : "TF"
+    trk_bar       := bar_index
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  R-TRACKER & WR DASHBOARD
+//  Trackea hasta dónde llegó cada trade: SL / 1R / 2R / 3R+
+//  WR = trades que tocaron 1R / total trades cerrados
+//  Acumulado (toda la historia) + Sesión (se resetea cada día)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ─── Estado del trade activo ──────────────────────────────────────────────────
+var string tr_state   = "FLAT"
+var float  tr_entry   = na
+var float  tr_sl      = na
+var float  tr_r05     = na   // 0.5R — nivel de salida parcial
+var float  tr_r1      = na   // 1R
+var float  tr_r2      = na   // 2R
+var float  tr_r3      = na   // 3R
+var float  tr_sl_pts  = na
+var bool   tr_is_long = false
+var string tr_mode    = "—"
+var bool   tr_hit_r05 = false
+var bool   tr_hit_r1  = false
+var bool   tr_hit_r2  = false
+var bool   tr_hit_r3  = false
+var float  tr_r15     = na
+var bool   tr_hit_r15 = false
+var int    tr_open_bar = -1  // FIX: tracking empieza en barra SIGUIENTE a la señal
+var int    bx_open_bar = -1  // barra donde se abrió el trade visual (para extensión de boxes)
+
+// ─── Tracking del BE — para el BT honesto ─────────────────────────────────────
+// Detecta si el precio tocó cada nivel de BE después de haber tocado el nivel anterior
+// Esto permite calcular el PnL real con BE en el BT
+var bool   tr_hit_be_buf  = false  // precio bajó al buffer (entrada−10pts) después de 0.5R
+var bool   tr_hit_be_ex   = false  // precio bajó al BE exacto (entrada) después de 1R
+var bool   tr_hit_be_lock = false  // precio bajó al lock (1R) después de 2R
+var float  tr_be_buf_lvl  = na     // nivel del buffer (entrada − 10pts)
+var float  tr_be_ex_lvl   = na     // nivel del BE exacto (entrada)
+var float  tr_be_lock_lvl = na     // nivel del lock (1R)
+
+// ─── Estado del runner ESTABILIZADO — solo cambia al cierre de barra ─────────
+// Problema: las condiciones intrabar oscilan cada tick → dashboard confuso
+// Solución: congelar el estado al cierre de cada vela 5M
+// El estado se mantiene FIJO durante toda la siguiente vela
+// → El dashboard dice lo mismo durante 5 minutos completos
+var string runner_state       = "OBSERVAR"
+var color  runner_state_color = color.new(#3a5060, 0)
+var string runner_state_str   = "~ observar"
+var int    runner_score       = 0
+var int    trade_bar_count    = 0   // barras desde que abrió el trade
+
+// Contar barras desde la entrada
+if tr_state != "FLAT" and barstate.isconfirmed
+    trade_bar_count := trade_bar_count + 1
+if tr_state == "FLAT"
+    trade_bar_count := 0
+
+if barstate.isconfirmed and is_regular
+    // ── Score de continuación basado en barras CERRADAS ────────────────────
+    // IMPORTANTE: ignoramos [1] durante las primeras 2 barras del trade
+    // porque [1] es la vela de señal que puede estar en contra por definición
+    // (ej: en SHORT la vela de señal cerró alcista para generar el breakout)
+    // Solo evaluamos después de 2 barras confirmadas desde la entrada
+
+    bool _trade_mature = trade_bar_count >= 2  // trade tiene al menos 2 barras
+
+    // Factor 1: CVD sostenido — usa [2],[3],[4] si trade es nuevo
+    bool _rs_cvd_up  = _trade_mature ? (cvd[1] > cvd[2] and cvd[2] > cvd[3]) : (cvd[2] > cvd[3] and cvd[3] > cvd[4])
+    bool _rs_cvd_dn  = _trade_mature ? (cvd[1] < cvd[2] and cvd[2] < cvd[3]) : (cvd[2] < cvd[3] and cvd[3] < cvd[4])
+
+    // Factor 2: Delta — usa [2],[3] si trade es nuevo (ignora vela de señal)
+    bool _rs_bull_d  = _trade_mature ? (f_is_bull_bar(1) and f_is_bull_bar(2)) : (f_is_bull_bar(2) and f_is_bull_bar(3))
+    bool _rs_bear_d  = _trade_mature ? (f_is_bear_bar(1) and f_is_bear_bar(2)) : (f_is_bear_bar(2) and f_is_bear_bar(3))
+
+    // Factor 3: Vela contraria — solo evaluar después de 2 barras
+    // En los primeros 2 barras, ignorar para evitar falso DÉBIL
+    bool _rs_contra_long  = _trade_mature and f_is_bear_bar(1)
+    bool _rs_contra_short = _trade_mature and f_is_bull_bar(1)
+
+    // Factor 4: Cuerpo de la última vela (usa [2] si trade es nuevo)
+    int _body_off   = _trade_mature ? 1 : 2
+    float _body1    = math.abs(close[_body_off] - open[_body_off])
+    float _range1   = high[_body_off] - low[_body_off]
+    bool  _strong_body = _range1 > 0 and (_body1 / _range1) >= 0.5
+
+    // Factor 5: CVD % del rango
+    bool _rs_cvd_strong = cvd_pct_of_range >= 40
+    bool _rs_cvd_weak   = cvd_pct_of_range < 25
+
+    // Factor 6: Régimen
+    bool _rs_trend = regime_trend
+    bool _rs_range = regime_range
+
+    // ── Calcular score ────────────────────────────────────────────────────
+    bool _is_long_trade  = tr_state != "FLAT" and tr_is_long
+    bool _is_short_trade = tr_state != "FLAT" and not tr_is_long
+
+    int _score = 0
+    if _is_long_trade
+        if _rs_cvd_up
+            _score += 2
+        if _rs_bull_d
+            _score += 2
+        if _strong_body and close[_body_off] > open[_body_off]
+            _score += 1
+        if _rs_cvd_strong
+            _score += 1
+        if _rs_trend
+            _score += 1
+        if _rs_cvd_dn
+            _score -= 2
+        if _rs_bear_d
+            _score -= 2
+        if _rs_contra_long and _strong_body
+            _score -= 2
+        if _rs_cvd_weak
+            _score -= 1
+        if _rs_range
+            _score -= 1
+    else if _is_short_trade
+        if _rs_cvd_dn
+            _score += 2
+        if _rs_bear_d
+            _score += 2
+        if _strong_body and close[_body_off] < open[_body_off]
+            _score += 1
+        if _rs_cvd_strong
+            _score += 1
+        if _rs_trend
+            _score += 1
+        if _rs_cvd_up
+            _score -= 2
+        if _rs_bull_d
+            _score -= 2
+        if _rs_contra_short and _strong_body
+            _score -= 2
+        if _rs_cvd_weak
+            _score -= 1
+        if _rs_range
+            _score -= 1
+
+    runner_score := _score
+
+    // ── Clasificar estado ─────────────────────────────────────────────────
+    // Durante las primeras 2 barras → OBSERVAR (período de gracia)
+    if tr_state == "FLAT"
+        runner_state       := "OBSERVAR"
+        runner_state_color := color.new(#3a5060, 0)
+        runner_state_str   := "~ sin trade activo"
+        runner_score       := 0
+    else if not _trade_mature
+        runner_state       := "OBSERVAR"
+        runner_state_color := color.new(#00d4ff, 40)
+        runner_state_str   := "⏳ esperando 2 barras..."
+    else if _score >= 3
+        runner_state       := "FUERTE"
+        runner_state_color := color.new(#00e5a0, 0)
+        runner_state_str   := "🟢 FUERTE — mantener runner"
+    else if _score >= 0
+        runner_state       := "NEUTRO"
+        runner_state_color := color.new(#ff9d00, 0)
+        runner_state_str   := "🟡 NEUTRO — mover a BE"
+    else
+        runner_state       := "DEBIL"
+        runner_state_color := color.new(#ff3d5a, 0)
+        runner_state_str   := "🔴 DÉBIL — cerrar runner"
+
+// ─── Contadores acumulados ────────────────────────────────────────────────────
+var int ac_total   = 0   // trades cerrados
+var int ac_sl      = 0   // terminaron en SL (nunca tocaron 1R)
+var int ac_r05     = 0   // tocaron 0.5R
+var int ac_r1      = 0   // tocaron 1R
+var int ac_r2      = 0   // tocaron 2R
+var int ac_r3      = 0   // tocaron 3R
+var int ac_tf      = 0   // total TF
+var int ac_tf_r1   = 0   // TF que tocaron 1R
+var int ac_mr      = 0   // total MR
+var int ac_mr_r1   = 0   // MR que tocaron 1R
+var int ac_long    = 0
+var int ac_long_r1 = 0
+var int ac_short   = 0
+var int ac_short_r1= 0
+
+// ─── Contadores semáforo BT ──────────────────────────────────────────────────
+// Para cada score (0,1,2,3): cuántos trades tocaron 1R con ese score
+// y de esos, cuántos llegaron a 2R y 3R
+// Se calculan en barstate.islast desde los arrays — no acumulan barra por barra
+
+// ─── Rachas y PnL acumulado ───────────────────────────────────────────────────
+// Racha: contador de SL/WR consecutivos — se resetea cuando cambia el resultado
+var int   ac_streak_sl  = 0   // SL consecutivos actuales
+var int   ac_streak_wr  = 0   // WR (1R+) consecutivos actuales
+var int   ac_max_sl     = 0   // máximo histórico de SL seguidos
+var int   ac_max_wr     = 0   // máximo histórico de WR seguidos
+// PnL acumulado usando $400 de riesgo fijo
+// SL     = -$400
+// +1R    = +$400  (TP1 = 1R → ganancia = riesgo × 1)
+// +2R    = +$800
+// +3R    = +$1200
+// end_of_session sin tocar 1R = -$400 (SL implícito)
+var float ac_pnl        = 0.0
+var float ac_max_dd     = 0.0   // máximo drawdown desde el pico
+var float ac_peak       = 0.0   // pico máximo de PnL
+
+// ─── Contadores de sesión ─────────────────────────────────────────────────────
+var int ss_total   = 0
+var int ss_sl      = 0
+var int ss_r05     = 0
+var int ss_r1      = 0
+var int ss_r2      = 0
+var int ss_r3      = 0
+
+if is_new_session
+    ss_total := 0
+    ss_sl    := 0
+    ss_r05   := 0
+    ss_r1    := 0
+    ss_r2    := 0
+    ss_r3    := 0
+
+// ─── Arrays del trade log (máx 20 trades) ────────────────────────────────────
+var int      LOG_MAX      = 100
+var int[]    lg_num       = array.new_int()
+var string[] lg_time      = array.new_string()
+var string[] lg_mode      = array.new_string()
+var string[] lg_dir       = array.new_string()
+var float[]  lg_entry     = array.new_float()
+var float[]  lg_sl_pts    = array.new_float()
+var string[] lg_r05       = array.new_string()  // tocó 0.5R
+var string[] lg_r1        = array.new_string()
+var string[] lg_r15       = array.new_string()
+var string[] lg_r2        = array.new_string()
+var string[] lg_r3        = array.new_string()
+var string[] lg_result    = array.new_string()
+var int[]    lg_sem       = array.new_int()    // score del semáforo al tocar 1R (0-3)
+var string[] lg_be_buf    = array.new_string() // tocó el buffer BE post-0.5R
+var string[] lg_be_ex     = array.new_string() // tocó el BE exacto post-1R
+var string[] lg_be_lock   = array.new_string() // tocó el lock post-2R
+var int      lg_count     = 0
+
+// ─── Abrir trade ──────────────────────────────────────────────────────────────
+if (trk_has_long or trk_has_short) and tr_state == "FLAT" and barstate.isconfirmed
+    bool _il   = trk_has_long
+    bool _is_mr = trk_mode == "MR"
+    // Protección NaN: si entry_sl_pts es na (señal intrabar no persistió hasta cierre)
+    // usa el SL mínimo como fallback para no romper los arrays del log
+    float _sl_p = na(entry_sl_pts) or entry_sl_pts <= 0 ? i_sl_min_pts : entry_sl_pts
+    tr_state   := _il ? (_is_mr ? "LONG_MR" : "LONG_TF") : (_is_mr ? "SHORT_MR" : "SHORT_TF")
+    tr_entry   := close
+    tr_sl      := _il ? close - _sl_p           : close + _sl_p
+    tr_r05     := _il ? close + _sl_p * 0.5     : close - _sl_p * 0.5
+    tr_r1      := _il ? close + _sl_p * 1.0     : close - _sl_p * 1.0
+    tr_r15     := _il ? close + _sl_p * 1.5     : close - _sl_p * 1.5
+    tr_r2      := _il ? close + _sl_p * 2.0     : close - _sl_p * 2.0
+    tr_r3      := _il ? close + _sl_p * 3.0     : close - _sl_p * 3.0
+    tr_sl_pts  := _sl_p
+    // ── Niveles BE de la gestión Optimizada ────────────────────────────────
+    // Cuando el precio alcanza cada nivel R, el SL se mueve a:
+    // En 1R:   SL → entry ± (SL×15%)   (buffer proporcional)
+    // En 1.5R: SL → entry exacto       (BE)
+    // En 2R:   SL → entry ± (SL×0.75) (lock 0.75R)
+    float _buf15 = _sl_p * 0.15
+    tr_be_buf_lvl  := _il ? close - _buf15        : close + _buf15   // nivel SL tras 1R
+    tr_be_ex_lvl   := _il ? close                 : close            // nivel SL tras 1.5R (entry)
+    tr_be_lock_lvl := _il ? close + _sl_p * 0.75 : close - _sl_p * 0.75  // nivel SL tras 2R
+    tr_is_long  := _il
+    tr_mode    := _is_mr ? "MR" : "TF"
+    tr_open_bar := bar_index
+    tr_hit_r05 := false
+    tr_hit_r1  := false
+    tr_hit_r15 := false
+    tr_hit_r2  := false
+    tr_hit_r3  := false
+    // Push al log
+    lg_count := lg_count + 1
+    _tz2 = "America/New_York"
+    _hh2 = hour(time,   _tz2) < 10 ? "0" + str.tostring(hour(time,   _tz2)) : str.tostring(hour(time,   _tz2))
+    _mm2 = minute(time, _tz2) < 10 ? "0" + str.tostring(minute(time, _tz2)) : str.tostring(minute(time, _tz2))
+    _mo2 = month(time, _tz2) < 10 ? "0" + str.tostring(month(time, _tz2)) : str.tostring(month(time, _tz2))
+    _dd2 = dayofmonth(time, _tz2) < 10 ? "0" + str.tostring(dayofmonth(time, _tz2)) : str.tostring(dayofmonth(time, _tz2))
+    array.push(lg_num,    lg_count)
+    array.push(lg_time,   _mo2 + "/" + _dd2 + " " + _hh2 + ":" + _mm2)
+    array.push(lg_mode,   _is_mr ? "MR" : "TF")
+    array.push(lg_dir,    _il ? "▲" : "▼")
+    array.push(lg_entry,  close)
+    array.push(lg_sl_pts, _sl_p)
+    array.push(lg_r05,    "·")
+    array.push(lg_r1,     "·")
+    array.push(lg_r15,    "·")
+    array.push(lg_r2,     "·")
+    array.push(lg_r3,     "·")
+    array.push(lg_result, "OPEN")
+    array.push(lg_sem,    -1)      // -1 = 1R no tocado aún
+    array.push(lg_be_buf,  "·")
+    array.push(lg_be_ex,   "·")
+    array.push(lg_be_lock, "·")
+    if array.size(lg_num) > LOG_MAX
+        array.shift(lg_num)
+        array.shift(lg_time)
+        array.shift(lg_mode)
+        array.shift(lg_dir)
+        array.shift(lg_entry)
+        array.shift(lg_sl_pts)
+        array.shift(lg_r05)
+        array.shift(lg_r1)
+        array.shift(lg_r15)
+        array.shift(lg_r2)
+        array.shift(lg_r3)
+        array.shift(lg_result)
+        array.shift(lg_sem)
+        array.shift(lg_be_buf)
+        array.shift(lg_be_ex)
+        array.shift(lg_be_lock)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SEMÁFORO DE CONTINUACIÓN — scope global, disponible en tracker y dashboard
+//  Debe declararse ANTES del tracker de R para que sem_score esté disponible
+// ═══════════════════════════════════════════════════════════════════════════════
+bool sem_active = sig_locked and not na(entry_price) and tr_state != "FLAT"
+bool _sem_il    = entry_dir == "LONG"
+
+// C1: CVD sostenido en dirección del trade
+bool sem_cvd = _sem_il ? cvd_rising_sustained : cvd_falling_sustained
+
+// C2: Delta fuerte en vela actual
+bool sem_delta = _sem_il ? bull_delta : bear_delta
+
+// C3: Vela anterior cerró con cuerpo fuerte (>60% del rango es cuerpo)
+float _body_prev   = math.abs(close[1] - open[1])
+float _range_prev  = high[1] - low[1]
+bool sem_body_prev = _range_prev > 0 and (_body_prev / _range_prev) >= 0.6
+float _body_curr   = math.abs(close - open)
+float _range_curr  = high - low
+bool sem_body_curr = _range_curr > 0 and (_body_curr / _range_curr) >= 0.6
+bool sem_body      = sem_body_prev and sem_body_curr
+
+// Score total: 0-3
+int sem_score = (sem_cvd ? 1 : 0) + (sem_delta ? 1 : 0) + (sem_body ? 1 : 0)
+
+// Zona de 1R — precio está cerca de TP1 (±5 pts)
+bool near_tp1 = not na(entry_tp1) and math.abs(close - entry_tp1) <= 5.0
+
+// Decisión del semáforo
+string sem_decision = sem_score >= 3 ? "🟢 DEJAR CORRER" : sem_score == 2 ? "🟡 MOVER A BE" : "🔴 CERRAR EN 1R"
+color  sem_color    = sem_score >= 3 ? color.new(#00e5a0,0) : sem_score == 2 ? color.new(#ff9d00,0) : color.new(#ff3d5a,0)
+
+// ─── Trackear R durante el trade ──────────────────────────────────────────────
+if tr_state != "FLAT" and barstate.isconfirmed and bar_index > tr_open_bar
+    int _li = array.size(lg_r1) - 1
+    if tr_is_long
+        bool _nr05 = not tr_hit_r05 and high >= tr_r05
+        bool _nr1  = not tr_hit_r1  and high >= tr_r1
+        // Cascada intra-barra: si la mecha cubre todo en una vela
+        // _nr1 puede ser true en esta misma barra, así que lo sumamos
+        bool _h_r1  = tr_hit_r1  or _nr1
+        bool _nr15  = _h_r1  and not tr_hit_r15 and high >= tr_r15
+        bool _h_r15 = tr_hit_r15 or _nr15
+        bool _nr2   = _h_r15 and not tr_hit_r2  and high >= tr_r2
+        bool _h_r2  = tr_hit_r2  or _nr2
+        bool _nr3   = _h_r2  and not tr_hit_r3  and high >= tr_r3
+        // SL solo se mueve si la vela CIERRA sobre el nivel (evita whipsaws)
+        bool _sl_move_r15 = _h_r1  and not tr_hit_r15 and close >= tr_r15
+        bool _sl_move_r2  = _h_r15 and not tr_hit_r2  and close >= tr_r2
+        tr_hit_r05 := tr_hit_r05 or _nr05
+        tr_hit_r1  := tr_hit_r1  or _nr1
+        tr_hit_r15 := tr_hit_r15 or _nr15
+        tr_hit_r2  := tr_hit_r2  or _nr2
+        tr_hit_r3  := tr_hit_r3  or _nr3
+        // SL solo se mueve si la vela cerró sobre el nivel (no por mecha)
+        if _nr1          and not na(tr_be_buf_lvl)
+            tr_sl := tr_be_buf_lvl
+        if _sl_move_r15  and not na(tr_be_ex_lvl)
+            tr_sl := tr_be_ex_lvl
+        if _sl_move_r2   and not na(tr_be_lock_lvl)
+            tr_sl := tr_be_lock_lvl
+        if _nr3
+            tr_sl := tr_r3
+        if _li >= 0
+            if _nr05
+                array.set(lg_r05, _li, "✓")
+            if _nr1
+                array.set(lg_r1,  _li, "✓")
+                array.set(lg_sem, _li, sem_score)
+            if _nr15
+                array.set(lg_r15, _li, "✓")
+            if _nr2
+                array.set(lg_r2,  _li, "✓")
+            if _nr3
+                array.set(lg_r3,  _li, "✓")
+        // ── Tracking BE para LONG ──────────────────────────────────────────────
+        // Buffer: precio bajó a entrada−10pts después de tocar 0.5R
+        if tr_hit_r05 and not tr_hit_be_buf and not na(tr_be_buf_lvl) and low <= tr_be_buf_lvl
+            tr_hit_be_buf := true
+        // BE exacto: precio bajó a la entrada después de tocar 1R
+        if tr_hit_r1 and not tr_hit_be_ex and not na(tr_be_ex_lvl) and low <= tr_be_ex_lvl
+            tr_hit_be_ex := true
+        // Lock 1R: precio bajó a 1R después de tocar 2R
+        if tr_hit_r2 and not tr_hit_be_lock and not na(tr_be_lock_lvl) and low <= tr_be_lock_lvl
+            tr_hit_be_lock := true
+    else
+        bool _nr05s = not tr_hit_r05 and low <= tr_r05
+        bool _nr1s  = not tr_hit_r1  and low <= tr_r1
+        bool _h_r1s  = tr_hit_r1  or _nr1s
+        bool _nr15s  = _h_r1s  and not tr_hit_r15 and low <= tr_r15
+        bool _h_r15s = tr_hit_r15 or _nr15s
+        bool _nr2s   = _h_r15s and not tr_hit_r2  and low <= tr_r2
+        bool _h_r2s  = tr_hit_r2  or _nr2s
+        bool _nr3s   = _h_r2s  and not tr_hit_r3  and low <= tr_r3
+        bool _sl_move_r15s = _h_r1s  and not tr_hit_r15 and close <= tr_r15
+        bool _sl_move_r2s  = _h_r15s and not tr_hit_r2  and close <= tr_r2
+        tr_hit_r05 := tr_hit_r05 or _nr05s
+        tr_hit_r1  := tr_hit_r1  or _nr1s
+        tr_hit_r15 := tr_hit_r15 or _nr15s
+        tr_hit_r2  := tr_hit_r2  or _nr2s
+        tr_hit_r3  := tr_hit_r3  or _nr3s
+        if _nr1s          and not na(tr_be_buf_lvl)
+            tr_sl := tr_be_buf_lvl
+        if _sl_move_r15s  and not na(tr_be_ex_lvl)
+            tr_sl := tr_be_ex_lvl
+        if _sl_move_r2s   and not na(tr_be_lock_lvl)
+            tr_sl := tr_be_lock_lvl
+        if _nr3s
+            tr_sl := tr_r3
+        if _li >= 0
+            if _nr05s
+                array.set(lg_r05, _li, "✓")
+            if _nr1s
+                array.set(lg_r1,  _li, "✓")
+                array.set(lg_sem, _li, sem_score)
+            if _nr15s
+                array.set(lg_r15, _li, "✓")
+            if _nr2s
+                array.set(lg_r2,  _li, "✓")
+            if _nr3s
+                array.set(lg_r3,  _li, "✓")
+        // ── Tracking BE para SHORT ─────────────────────────────────────────────
+        if tr_hit_r05 and not tr_hit_be_buf and not na(tr_be_buf_lvl) and high >= tr_be_buf_lvl
+            tr_hit_be_buf := true
+        if tr_hit_r1 and not tr_hit_be_ex and not na(tr_be_ex_lvl) and high >= tr_be_ex_lvl
+            tr_hit_be_ex := true
+        if tr_hit_r2 and not tr_hit_be_lock and not na(tr_be_lock_lvl) and high >= tr_be_lock_lvl
+            tr_hit_be_lock := true
+
+// ─── Cerrar trade: SL tocado o sesión termina ─────────────────────────────────
+// Pine Script no permite modificar vars globales dentro de funciones
+// → lógica de cierre inline directamente
+hit_sl_now    = tr_state != "FLAT" and barstate.isconfirmed and (tr_is_long ? low <= tr_sl : high >= tr_sl)
+end_of_session = tr_state != "FLAT" and not is_regular and is_regular[1]
+
+float eod_r_raw = na
+float eod_r     = na
+if end_of_session and not na(tr_entry) and not na(tr_sl_pts) and tr_sl_pts > 0
+    eod_r_raw := tr_is_long ? (close - tr_entry) / tr_sl_pts : (tr_entry - close) / tr_sl_pts
+    // Floor = el resultado mínimo garantizado por el SL activo
+    // Refleja exactamente la gestión Optimizada
+    float _eod_floor = not tr_hit_r1  ? -1.0  :
+                       not tr_hit_r15 ? -0.15 :
+                       not tr_hit_r2  ?  0.0  :
+                                         0.75
+    // Cap = el máximo es 3R (si llegó a 3R no debería estar en EOD)
+    eod_r := math.max(_eod_floor, math.min(3.0, eod_r_raw))
+
+if (hit_sl_now or end_of_session) and barstate.isconfirmed
+    // Acumulado
+    ac_total := ac_total + 1
+    ss_total := ss_total + 1
+    if tr_hit_r05
+        ac_r05 := ac_r05 + 1
+        ss_r05 := ss_r05 + 1
+    if tr_hit_r1
+        ac_r1 := ac_r1 + 1
+        ss_r1 := ss_r1 + 1
+    else
+        ac_sl := ac_sl + 1
+        ss_sl := ss_sl + 1
+    if tr_hit_r2
+        ac_r2 := ac_r2 + 1
+        ss_r2 := ss_r2 + 1
+    if tr_hit_r3
+        ac_r3 := ac_r3 + 1
+        ss_r3 := ss_r3 + 1
+    // Por modo
+    if tr_mode == "TF"
+        ac_tf := ac_tf + 1
+        if tr_hit_r1
+            ac_tf_r1 := ac_tf_r1 + 1
+    else
+        ac_mr := ac_mr + 1
+        if tr_hit_r1
+            ac_mr_r1 := ac_mr_r1 + 1
+    // Por dirección
+    if tr_is_long
+        ac_long := ac_long + 1
+        if tr_hit_r1
+            ac_long_r1 := ac_long_r1 + 1
+    else
+        ac_short := ac_short + 1
+        if tr_hit_r1
+            ac_short_r1 := ac_short_r1 + 1
+    // Actualizar resultado en el log
+    int _li2 = array.size(lg_result) - 1
+    if _li2 >= 0
+        string _res = ""
+        if end_of_session and not na(eod_r)
+            string _eod_str = str.tostring(math.round(eod_r * 100) / 100.0)
+            _res := (eod_r >= 0 ? "+" : "") + _eod_str + "R"
+        else
+            // Resultado según el SL activo al cierre (gestión Optimizada)
+            if tr_hit_r3
+                _res := "+3R"
+            else if tr_hit_r2
+                _res := "+0.75R"
+            else if tr_hit_r15
+                _res := "BE"
+            else if tr_hit_r1
+                _res := "-0.15R"
+            else if tr_hit_r05
+                _res := "+0.5R"
+            else
+                _res := "SL"
+        array.set(lg_result, _li2, _res)
+        if not tr_hit_r05
+            array.set(lg_r05, _li2, "✗")
+        if not tr_hit_r1
+            array.set(lg_r1, _li2, "✗")
+        if tr_hit_r1 and not tr_hit_r15
+            array.set(lg_r15, _li2, "✗")
+        if tr_hit_r15 and not tr_hit_r2
+            array.set(lg_r2, _li2, "✗")
+        if tr_hit_r2 and not tr_hit_r3
+            array.set(lg_r3, _li2, "✗")
+        // Guardar estado BE en el log
+        int _li3 = array.size(lg_be_buf) - 1
+        if _li3 >= 0
+            array.set(lg_be_buf,  _li3, tr_hit_be_buf  ? "✓" : "✗")
+            array.set(lg_be_ex,   _li3, tr_hit_be_ex   ? "✓" : "✗")
+            array.set(lg_be_lock, _li3, tr_hit_be_lock  ? "✓" : "✗")
+    // ── Rachas ────────────────────────────────────────────────────────────────
+    if tr_hit_r1
+        // WR — resetea racha SL, incrementa racha WR
+        ac_streak_sl := 0
+        ac_streak_wr := ac_streak_wr + 1
+        if ac_streak_wr > ac_max_wr
+            ac_max_wr := ac_streak_wr
+    else
+        // SL — resetea racha WR, incrementa racha SL
+        ac_streak_wr := 0
+        ac_streak_sl := ac_streak_sl + 1
+        if ac_streak_sl > ac_max_sl
+            ac_max_sl := ac_streak_sl
+    // PnL se recalcula en barstate.islast desde los arrays del log
+    // para que responda al cambio de i_exit_mode sin recargar el indicador
+    // Reset estado
+    tr_state   := "FLAT"
+    tr_open_bar := -1
+    bx_open_bar := -1  // marcar boxes como cerrados — no extender más
+    tr_hit_r05 := false
+    tr_hit_r1  := false
+    tr_hit_r15 := false
+    tr_hit_r2  := false
+    tr_hit_r3  := false
+    tr_hit_be_buf  := false
+    tr_hit_be_ex   := false
+    tr_hit_be_lock := false
+    tr_be_buf_lvl  := na
+    tr_be_ex_lvl   := na
+    tr_be_lock_lvl := na
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  ALERTCONDITIONS
+// ═══════════════════════════════════════════════════════════════════════════════
+alertcondition(long_sig,  "OF — LONG Signal",      "OF LONG Signal fired")
+alertcondition(short_sig, "OF — SHORT Signal",     "OF SHORT Signal fired")
+
+near_val_alert = is_regular and mode_mr and not na(prev_val) and math.abs(low - prev_val) <= dyn_sl * 1.5 and past_blackout
+near_vah_alert = is_regular and mode_mr and not na(prev_vah) and math.abs(high - prev_vah) <= dyn_sl * 1.5 and past_blackout
+alertcondition(near_val_alert, "OF — Precio cerca VAL", "Precio acercandose a PREV VAL")
+alertcondition(near_vah_alert, "OF — Precio cerca VAH", "Precio acercandose a PREV VAH")
+
+// ─── Triángulos visuales ──────────────────────────────────────────────────────
+if i_show_signals and (long_sig or test_long_sig) and not na(entry_price) and entry_dir == "LONG"
+    label.new(bar_index, low, "▲",
+              style=label.style_label_up, color=C_BULL,
+              textcolor=color.white, size=size.normal)
+
+if i_show_signals and (short_sig or test_short_sig) and not na(entry_price) and entry_dir == "SHORT"
+    label.new(bar_index, high, "▼",
+              style=label.style_label_down, color=C_BEAR,
+              textcolor=color.white, size=size.normal)
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  VISUALIZACIÓN
+// ═══════════════════════════════════════════════════════════════════════════════
+bgcolor(i_show_mode_bg and is_regular and mode_mr ? color.new(color.blue,   92) : na, title="MR Zone")
+bgcolor(i_show_mode_bg and is_regular and mode_tf ? color.new(color.orange, 92) : na, title="TF Zone")
+
+f_draw_delta() =>
+    if i_show_delta_bars and is_regular and barstate.isconfirmed
+        float _bar_h   = high - low
+        float _delta_n = volume > 0 ? bar_delta / volume : 0.0
+        float _bar_len = _bar_h * math.abs(_delta_n) * 0.8
+        if _delta_n > 0.1
+            line.new(bar_index, high, bar_index, high + _bar_len,
+                     color=color.new(#00e5a0, 20), width=2)
+        else if _delta_n < -0.1
+            line.new(bar_index, low, bar_index, low - _bar_len,
+                     color=color.new(#ff3d5a, 20), width=2)
+    if bull_div and barstate.isconfirmed
+        label.new(bar_index, low, "▲CVD",
+                  style=label.style_label_up, color=color.new(C_BULL, 50),
+                  textcolor=color.white, size=size.tiny)
+    if bear_div and barstate.isconfirmed
+        label.new(bar_index, high, "▼CVD",
+                  style=label.style_label_down, color=color.new(C_BEAR, 50),
+                  textcolor=color.white, size=size.tiny)
+    0
+
+f_draw_delta()
+
+// ─── Boxes TP/SL — todos los trades, no solo el último ────────────────────────
+// Usamos line + label en lugar de box para poder dibujar múltiples trades
+// Pine Script tiene límite de 500 lines y 500 labels — suficiente para BT
+// Cada señal dibuja: línea SL, línea 0.5R, línea 1R, línea 2R, línea 3R + labels
+
+// ─── Referencias a boxes activos para extensión dinámica ─────────────────────
+// Guardamos referencias a los 5 boxes del trade activo
+// En barstate.islast los extendemos hasta donde terminó el trade
+var box bx_sl   = na  // zona SL
+var box bx_05r  = na  // zona 0.5R
+var box bx_1r   = na  // zona 1R
+var box bx_15r  = na  // zona 1.5R (nuevo)
+var box bx_2r   = na  // zona 2R
+var box bx_3r   = na  // zona 3R
+
+// Disparador: cada vez que hay señal nueva
+bool just_fired_long_c  = (long_sig or test_long_sig) and not na(entry_price) and entry_dir == "LONG"
+bool just_fired_short_c = (short_sig or test_short_sig) and not na(entry_price) and entry_dir == "SHORT"
+
+if i_show_levels and i_show_boxes and just_fired_long_c
+    float _ep    = entry_price
+    float _sl    = entry_sl_pts
+    int   _x1    = bar_index
+    int   _x2    = bar_index + 40   // inicial — se extenderá dinámicamente
+    int   _lx    = bar_index + i_label_offset
+    float _sl_p  = _ep - _sl
+    float _t05_p = _ep + _sl * 0.5
+    float _t1_p  = _ep + _sl * 1.0
+    float _t15_p = _ep + _sl * 1.5
+    float _t2_p  = _ep + _sl * 2.0
+    float _t3_p  = _ep + _sl * 3.0
+    // Crear boxes y guardar referencias
+    bx_sl  := box.new(_x1, _ep,    _x2, _sl_p,  border_color=color.new(#ff3d5a,40), bgcolor=color.new(#ff3d5a,82), border_width=1)
+    bx_05r := box.new(_x1, _t05_p, _x2, _ep,    border_color=color.new(#00e5a0,70), bgcolor=color.new(#00e5a0,93), border_width=1)
+    bx_1r  := box.new(_x1, _t1_p,  _x2, _t05_p, border_color=color.new(#00e5a0,50), bgcolor=color.new(#00e5a0,88), border_width=1)
+    bx_15r := box.new(_x1, _t15_p, _x2, _t1_p,  border_color=color.new(#00e5a0,35), bgcolor=color.new(#00e5a0,84), border_width=1)
+    bx_2r  := box.new(_x1, _t2_p,  _x2, _t15_p, border_color=color.new(#00e5a0,25), bgcolor=color.new(#00e5a0,80), border_width=1)
+    bx_3r  := box.new(_x1, _t3_p,  _x2, _t2_p,  border_color=color.new(#00e5a0,15), bgcolor=color.new(#00e5a0,75), border_width=1)
+    bx_open_bar := bar_index
+    // Labels con nueva gestión
+    label.new(_lx, _ep,    "▲ LONG " + entry_mode + "  " + f_num(_ep) + "  SL:" + f_num(_sl) + "pts", style=label.style_label_left, color=color.new(#00d4ff,10), textcolor=color.new(#000000,0), size=size.normal)
+    label.new(_lx, _sl_p,  "SL  "   + f_num(_sl_p),  style=label.style_label_left, color=color.new(#ff3d5a,20), textcolor=color.white, size=size.small)
+    label.new(_lx, _t05_p, "0.5R  " + f_num(_t05_p) + "  dejar correr", style=label.style_label_left, color=color.new(#00e5a0,70), textcolor=color.white, size=size.small)
+    label.new(_lx, _t1_p,  "1R  "   + f_num(_t1_p)  + "  SL -" + str.tostring(math.round(_sl * 0.15, 1)) + "pts", style=label.style_label_left, color=color.new(#00e5a0,50), textcolor=color.white, size=size.small)
+    label.new(_lx, _t15_p, "1.5R  " + f_num(_t15_p) + "  SL a BE", style=label.style_label_left, color=color.new(#00e5a0,35), textcolor=color.white, size=size.small)
+    label.new(_lx, _t2_p,  "2R  "   + f_num(_t2_p)  + "  lock 0.75R", style=label.style_label_left, color=color.new(#00e5a0,25), textcolor=color.white, size=size.small)
+    label.new(_lx, _t3_p,  "3R  "   + f_num(_t3_p)  + "  cerrar todo", style=label.style_label_left, color=color.new(#00e5a0,15), textcolor=color.white, size=size.small)
+
+if i_show_levels and i_show_boxes and just_fired_short_c
+    float _ep    = entry_price
+    float _sl    = entry_sl_pts
+    int   _x1    = bar_index
+    int   _x2    = bar_index + 40
+    int   _lx    = bar_index + i_label_offset
+    float _sl_p  = _ep + _sl
+    float _t05_p = _ep - _sl * 0.5
+    float _t1_p  = _ep - _sl * 1.0
+    float _t15_p = _ep - _sl * 1.5
+    float _t2_p  = _ep - _sl * 2.0
+    float _t3_p  = _ep - _sl * 3.0
+    bx_sl  := box.new(_x1, _sl_p,  _x2, _ep,    border_color=color.new(#ff3d5a,40), bgcolor=color.new(#ff3d5a,82), border_width=1)
+    bx_05r := box.new(_x1, _ep,    _x2, _t05_p, border_color=color.new(#00e5a0,70), bgcolor=color.new(#00e5a0,93), border_width=1)
+    bx_1r  := box.new(_x1, _t05_p, _x2, _t1_p,  border_color=color.new(#00e5a0,50), bgcolor=color.new(#00e5a0,88), border_width=1)
+    bx_15r := box.new(_x1, _t1_p,  _x2, _t15_p, border_color=color.new(#00e5a0,35), bgcolor=color.new(#00e5a0,84), border_width=1)
+    bx_2r  := box.new(_x1, _t15_p, _x2, _t2_p,  border_color=color.new(#00e5a0,25), bgcolor=color.new(#00e5a0,80), border_width=1)
+    bx_3r  := box.new(_x1, _t2_p,  _x2, _t3_p,  border_color=color.new(#00e5a0,15), bgcolor=color.new(#00e5a0,75), border_width=1)
+    bx_open_bar := bar_index
+    label.new(_lx, _ep,    "▼ SHORT " + entry_mode + "  " + f_num(_ep) + "  SL:" + f_num(_sl) + "pts", style=label.style_label_left, color=color.new(#ff3d5a,10), textcolor=color.white, size=size.normal)
+    label.new(_lx, _sl_p,  "SL  "   + f_num(_sl_p),  style=label.style_label_left, color=color.new(#ff3d5a,20), textcolor=color.white, size=size.small)
+    label.new(_lx, _t05_p, "0.5R  " + f_num(_t05_p) + "  dejar correr", style=label.style_label_left, color=color.new(#00e5a0,70), textcolor=color.white, size=size.small)
+    label.new(_lx, _t1_p,  "1R  "   + f_num(_t1_p)  + "  SL -" + str.tostring(math.round(_sl * 0.15, 1)) + "pts", style=label.style_label_left, color=color.new(#00e5a0,50), textcolor=color.white, size=size.small)
+    label.new(_lx, _t15_p, "1.5R  " + f_num(_t15_p) + "  SL a BE", style=label.style_label_left, color=color.new(#00e5a0,35), textcolor=color.white, size=size.small)
+    label.new(_lx, _t2_p,  "2R  "   + f_num(_t2_p)  + "  lock 0.75R", style=label.style_label_left, color=color.new(#00e5a0,25), textcolor=color.white, size=size.small)
+    label.new(_lx, _t3_p,  "3R  "   + f_num(_t3_p)  + "  cerrar todo", style=label.style_label_left, color=color.new(#00e5a0,15), textcolor=color.white, size=size.small)
+    label.new(_lx, _t3_p,  "3R  "   + f_num(_t3_p),                       style=label.style_label_left, color=color.new(#00e5a0,55), textcolor=color.white, size=size.small)
+
+
+f_check(cond) => cond ? "✓" : "✗"
+f_col(cond)   => cond ? color.new(#00e5a0, 0) : color.new(#ff3d5a, 0)
+
+// ─── fill_real eliminado — boxes son permanentes, no se redibujan ─────────────
+
+// ─── Plot VWAP diario ────────────────────────────────────────────────────────
+plot(is_regular and not na(vwap_daily) ? vwap_daily : na,
+     title="VWAP diario",
+     color=color.new(#00d4ff, 20),
+     linewidth=2,
+     style=plot.style_line)
+
+// ─── Plot ORB ────────────────────────────────────────────────────────────────
+plot(is_regular and orb_set and not na(orb_high) ? orb_high : na,
+     title="ORB High",
+     color=color.new(#ff9d00, 20),
+     linewidth=1,
+     style=plot.style_linebr)
+plot(is_regular and orb_set and not na(orb_low) ? orb_low : na,
+     title="ORB Low",
+     color=color.new(#ff9d00, 20),
+     linewidth=1,
+     style=plot.style_linebr)
+
+// ─── Líneas VP ────────────────────────────────────────────────────────────────
+var line ln_pp = na
+var line ln_ph = na
+var line ln_pl = na
+var line ln_cp = na
+var line ln_ch = na
+var line ln_cl = na
+
+// ─── Líneas de gestión SL — se actualizan dinámicamente ───────────────────────
+// Muestran exactamente dónde mover el SL en Tradovate según el nivel tocado
+var line ln_sl_current  = na   // SL actual (rojo) — donde está ahora
+var line ln_sl_target   = na   // SL objetivo (donde moverlo) — naranja/verde
+var label lbl_sl_current = na
+var label lbl_sl_target  = na
+
+if barstate.islast
+    // ── Extender boxes hasta donde terminó el trade ──────────────────────────
+    // Si hay boxes activos, actualizamos el borde derecho en cada tick
+    // Cuando el trade termina (SL/BE/3R), los boxes quedan fijos en ese bar_index
+    if not na(bx_sl) and bx_open_bar >= 0
+        int _bx_right = tr_state != "FLAT" ? bar_index : bar_index
+        // El trade sigue activo → extender hasta ahora
+        // El trade cerró → el cierre ocurrió en la última barra confirmada
+        box.set_right(bx_sl,   _bx_right)
+        box.set_right(bx_05r,  _bx_right)
+        box.set_right(bx_1r,   _bx_right)
+        box.set_right(bx_15r,  _bx_right)
+        box.set_right(bx_2r,   _bx_right)
+        box.set_right(bx_3r,   _bx_right)
+
+if barstate.islast
+    s_bar = na(sess_bar) ? bar_index - 100 : sess_bar
+    e_bar = bar_index + 20
+
+    if i_show_prev_vp and not na(prev_poc)
+        line.delete(ln_pp)
+        line.delete(ln_ph)
+        line.delete(ln_pl)
+        ln_pp := line.new(s_bar, prev_poc, e_bar, prev_poc, color=C_PREV_POC, width=2, style=line.style_dashed)
+        ln_ph := line.new(s_bar, prev_vah, e_bar, prev_vah, color=C_PREV_VA,  width=1, style=line.style_dashed)
+        ln_pl := line.new(s_bar, prev_val, e_bar, prev_val, color=C_PREV_VA,  width=1, style=line.style_dashed)
+
+    if i_show_curr_vp and not na(curr_poc)
+        line.delete(ln_cp)
+        line.delete(ln_ch)
+        line.delete(ln_cl)
+        ln_cp := line.new(s_bar, curr_poc, e_bar, curr_poc, color=C_CURR_POC, width=2)
+        ln_ch := line.new(s_bar, curr_vah, e_bar, curr_vah, color=C_CURR_VA,  width=1)
+        ln_cl := line.new(s_bar, curr_val, e_bar, curr_val, color=C_CURR_VA,  width=1)
+
+    // ── Líneas de gestión SL — solo cuando hay trade activo ───────────────────
+    line.delete(ln_sl_current)
+    line.delete(ln_sl_target)
+    label.delete(lbl_sl_current)
+    label.delete(lbl_sl_target)
+
+    if sig_locked and not na(entry_price) and not na(entry_sl_pts)
+        bool   _lil2   = entry_dir == "LONG"
+        float  _e2     = i_fill_real_top > 0 ? i_fill_real_top : entry_price
+        float  _sl2    = entry_sl_pts
+        float  _sl_p2  = _lil2 ? _e2 - _sl2 : _e2 + _sl2
+        float  _t05_2  = _lil2 ? _e2 + _sl2 * 0.5 : _e2 - _sl2 * 0.5
+        float  _t1_2   = _lil2 ? _e2 + _sl2 * 1.0 : _e2 - _sl2 * 1.0
+        float  _buf2   = 10.0
+        float  _be_buf2 = _lil2 ? _e2 - _buf2 : _e2 + _buf2
+
+        // Calcular el nivel objetivo del SL según la gestión
+        float  _target_price = na
+        string _target_label = ""
+        color  _target_color = color.new(#ff9d00, 0)
+
+        // Gestión SL optimizada: 1R→buffer15% | 1.5R→BE | 2R→lock0.75R
+        float _buf15_2  = _sl2 * 0.15
+        float _be15_2   = _lil2 ? _e2 - _buf15_2 : _e2 + _buf15_2
+        float _be_ex_2  = _e2
+        float _lock075_2 = _lil2 ? _e2 + _sl2 * 0.75 : _e2 - _sl2 * 0.75
+
+        if not tr_hit_r1
+            _target_price := _sl_p2
+            _target_label := "SL ← mantener (hasta 1R)"
+            _target_color := color.new(#ff3d5a, 0)
+        else if tr_hit_r1 and not tr_hit_r15
+            _target_price := _be15_2
+            _target_label := "🟡 MOVER SL AQUÍ (entry -" + str.tostring(math.round(_buf15_2, 1)) + "pts)"
+            _target_color := color.new(#ff9d00, 0)
+        else if tr_hit_r15 and not tr_hit_r2
+            _target_price := _be_ex_2
+            _target_label := "🟢 MOVER SL AQUÍ (BE exacto)"
+            _target_color := color.new(#00e5a0, 0)
+        else if tr_hit_r2
+            _target_price := _lock075_2
+            _target_label := "🟢 MOVER SL AQUÍ (lock 0.75R)"
+            _target_color := color.new(#00e5a0, 0)
+
+        int _sl_x1 = na(sess_bar) ? bar_index - 50 : sess_bar
+        int _sl_x2 = bar_index + 30
+
+        // Línea del SL actual (rojo punteado — donde está ahora en Tradovate)
+        ln_sl_current := line.new(_sl_x1, _sl_p2, _sl_x2, _sl_p2,
+             color=color.new(#ff3d5a, 40), width=1, style=line.style_dashed)
+        lbl_sl_current := label.new(_sl_x2, _sl_p2,
+             "SL actual: " + f_num(_sl_p2),
+             style=label.style_label_left,
+             color=color.new(#ff3d5a, 60),
+             textcolor=color.white, size=size.tiny)
+
+        // Línea del SL objetivo (donde moverlo) — más prominente
+        if not na(_target_price) and _target_price != _sl_p2
+            ln_sl_target := line.new(_sl_x1, _target_price, _sl_x2, _target_price,
+                 color=_target_color, width=2, style=line.style_solid)
+            lbl_sl_target := label.new(_sl_x2, _target_price,
+                 _target_label + "  " + f_num(_target_price),
+                 style=label.style_label_left,
+                 color=color.new(color.black, 40),
+                 textcolor=_target_color, size=size.small)
+
+// ─── Labels VP ────────────────────────────────────────────────────────────────
+var label lbl_prev_poc = na
+var label lbl_prev_vah = na
+var label lbl_prev_val = na
+var label lbl_curr_poc = na
+var label lbl_curr_vah = na
+var label lbl_curr_val = na
+
+if barstate.islast
+    e_bar = bar_index + 20
+    if i_show_prev_vp and not na(prev_poc)
+        label.delete(lbl_prev_poc)
+        label.delete(lbl_prev_vah)
+        label.delete(lbl_prev_val)
+        lbl_prev_poc := label.new(e_bar, prev_poc, "PREV POC " + f_num(prev_poc), style=label.style_label_left, color=color.new(color.black,70), textcolor=C_PREV_POC, size=size.small)
+        lbl_prev_vah := label.new(e_bar, prev_vah, "PREV VAH " + f_num(prev_vah), style=label.style_label_left, color=color.new(color.black,70), textcolor=C_PREV_VA,  size=size.small)
+        lbl_prev_val := label.new(e_bar, prev_val, "PREV VAL " + f_num(prev_val), style=label.style_label_left, color=color.new(color.black,70), textcolor=C_PREV_VA,  size=size.small)
+    if i_show_curr_vp and not na(curr_poc)
+        label.delete(lbl_curr_poc)
+        label.delete(lbl_curr_vah)
+        label.delete(lbl_curr_val)
+        lbl_curr_poc := label.new(e_bar, curr_poc, "CURR POC " + f_num(curr_poc), style=label.style_label_left, color=color.new(color.black,70), textcolor=C_CURR_POC, size=size.small)
+        lbl_curr_vah := label.new(e_bar, curr_vah, "CURR VAH " + f_num(curr_vah), style=label.style_label_left, color=color.new(color.black,70), textcolor=C_CURR_VA,  size=size.small)
+        lbl_curr_val := label.new(e_bar, curr_val, "CURR VAL " + f_num(curr_val), style=label.style_label_left, color=color.new(color.black,70), textcolor=C_CURR_VA,  size=size.small)
+
+
+// f_check y f_col movidas antes del live dashboard
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SETUP POTENTIAL DASHBOARD
+// ═══════════════════════════════════════════════════════════════════════════════
+bool pot_long_mr  = is_regular and past_blackout and freq_ok and mode_mr and near_val and sl_valid
+bool pot_short_mr = is_regular and past_blackout and freq_ok and mode_mr and near_vah and sl_valid
+bool pot_long_tf  = is_regular and past_blackout and freq_ok and mode_tf and above_prev_va_confirmed and sl_valid
+bool pot_short_tf = is_regular and past_blackout and freq_ok and mode_tf and below_prev_va_confirmed and sl_valid
+
+bool pot_long  = pot_long_mr  or pot_long_tf
+bool pot_short = pot_short_mr or pot_short_tf
+
+bgcolor(pot_long  and not sig_locked ? color.new(color.lime, 96) : na, title="Potential LONG")
+bgcolor(pot_short and not sig_locked ? color.new(color.red,  96) : na, title="Potential SHORT")
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  SCORE DASHBOARD — desglose de factores A+/A/B/C
+//  Muestra el peso de cada factor para entender por qué el setup es A+ o C
+//  Útil para identificar patrones en trades fallidos
+// ═══════════════════════════════════════════════════════════════════════════════
+var table score_tbl = table.new(position.top_left, 3, 12,
+     bgcolor=color.new(#07090c, 5),
+     border_color=color.new(#1e3a4a, 0), border_width=1,
+     frame_color=color.new(#00d4ff, 60), frame_width=1)
+
+f_draw_score() =>
+    if barstate.islast and i_show_score and is_regular
+        color _sb0  = color.new(#07090c, 0)
+        color _sb1  = color.new(#0d1a24, 0)
+        color _scv  = color.new(#c8d8e0, 0)
+        color _sdim = color.new(#3a5060, 0)
+        color _sgood = color.new(#00e5a0, 0)
+        color _sbad  = color.new(#ff3d5a, 0)
+        color _sgold = color.new(#ff9d00, 0)
+
+        // Dirección activa o la mejor potencial
+        bool _sl = sig_locked and not na(entry_price)
+        // Sincronización con señal técnica:
+        // 1. Si hay trade activo → usar dirección del trade
+        // 2. Si hay señal técnica pendiente → usar esa dirección
+        // 3. Si no hay nada → mostrar la mejor dirección potencial
+        bool _has_long_signal = long_sig or test_long_sig
+        bool _has_short_signal = short_sig or test_short_sig
+        bool _il = _sl ? entry_dir == "LONG" :
+                   _has_long_signal ? true :
+                   _has_short_signal ? false :
+                   _setup_score_long >= _setup_score_short
+
+        // Si hay trade activo → usar scores CONGELADOS al momento de la entrada
+        // Si no hay trade → usar scores actuales (evaluando setup potencial)
+        float _total_score = _sl ? entry_setup_score : (_il ? _setup_score_long : _setup_score_short)
+        string _grade = _sl ? entry_setup_grade : (_il ? _grade_long : _grade_short)
+        color  _grade_col = f_setup_color(_grade)
+
+        // Factores: congelados si trade activo, actuales si no
+        int _d_vwap   = _sl ? entry_s_vwap   : f_vwap_score(_il)
+        int _d_struct  = _sl ? entry_s_struct  : f_struct_score(_il)
+        int _d_orb    = _sl ? entry_s_orb    : f_orb_score(_il)
+        int _d_poc    = _sl ? entry_s_poc    : f_poc_score(_il)
+        int _d_regime = _sl ? entry_s_regime : f_regime_score(_il)
+        int _d_cvd    = _sl ? entry_s_cvd    : f_cvd_score(_il)
+        int _d_candle = _sl ? entry_s_candle : f_candle_score()
+
+        // Header — indica si es score congelado o actual
+        string _hdr = (_il ? "▲ LONG" : "▼ SHORT") + "  " + _grade + "  " + (_sl ? "★ entrada" : "potencial") + "  " + str.tostring(math.round(_total_score)) + "/13"
+        table.cell(score_tbl, 0, 0, _hdr,    text_color=_grade_col, bgcolor=_sb0, text_size=size.small)
+        table.cell(score_tbl, 1, 0, "pts",   text_color=_sdim,      bgcolor=_sb0, text_size=size.tiny)
+        table.cell(score_tbl, 2, 0, "estado",text_color=_sdim,      bgcolor=_sb0, text_size=size.tiny)
+
+        // ── Factor 1: VWAP ────────────────────────────────────────────────────────
+        int _s_vwap = _d_vwap
+        color _c_vwap = _s_vwap > 0 ? _sgood : _s_vwap < 0 ? _sbad : _sdim
+        string _v_vwap = na(vwap_daily) ? "sin datos" : _il ? (price_above_vwap ? "↑ sobre VWAP" : "↓ bajo VWAP") : (price_below_vwap ? "↓ bajo VWAP" : "↑ sobre VWAP")
+        table.cell(score_tbl, 0, 1, "VWAP",         text_color=_scv,   bgcolor=_sb1, text_size=size.small)
+        table.cell(score_tbl, 1, 1, (_s_vwap >= 0 ? "+" : "") + str.tostring(_s_vwap), text_color=_c_vwap, bgcolor=_sb1, text_size=size.small)
+        table.cell(score_tbl, 2, 1, _v_vwap,        text_color=_c_vwap, bgcolor=_sb1, text_size=size.small)
+
+        // ── Factor 2: Estructura mayor ────────────────────────────────────────────
+        int _s_struct = _d_struct
+        color _c_struct = _s_struct > 0 ? _sgood : _s_struct < 0 ? _sbad : _sdim
+        string _v_struct = _il ? (very_near_major_high ? "EN máximos hist." : near_major_high ? "Cerca máximos" : near_major_low ? "Cerca soporte" : "Zona libre") : (very_near_major_low ? "EN mínimos hist." : near_major_low ? "Cerca mínimos" : near_major_high ? "Cerca resist." : "Zona libre")
+        table.cell(score_tbl, 0, 2, "Estructura",    text_color=_scv,    bgcolor=_sb0, text_size=size.small)
+        table.cell(score_tbl, 1, 2, (_s_struct >= 0 ? "+" : "") + str.tostring(_s_struct), text_color=_c_struct, bgcolor=_sb0, text_size=size.small)
+        table.cell(score_tbl, 2, 2, _v_struct,       text_color=_c_struct, bgcolor=_sb0, text_size=size.small)
+
+        // ── Factor 3: ORB ─────────────────────────────────────────────────────────
+        int _s_orb = _d_orb
+        color _c_orb = _s_orb > 0 ? _sgood : _s_orb < 0 ? _sbad : _sdim
+        string _v_orb = not orb_set ? "⏳ sin confirmar" : _il ? (price_above_orb ? "Sobre ORB High" : price_in_orb ? "Dentro del ORB" : "Bajo ORB Low") : (price_below_orb ? "Bajo ORB Low" : price_in_orb ? "Dentro del ORB" : "Sobre ORB High")
+        table.cell(score_tbl, 0, 3, "ORB",           text_color=_scv,   bgcolor=_sb1, text_size=size.small)
+        table.cell(score_tbl, 1, 3, (_s_orb >= 0 ? "+" : "") + str.tostring(_s_orb), text_color=_c_orb, bgcolor=_sb1, text_size=size.small)
+        table.cell(score_tbl, 2, 3, _v_orb,          text_color=_c_orb, bgcolor=_sb1, text_size=size.small)
+
+        // ── Factor 4: PREV POC ────────────────────────────────────────────────────
+        int _s_poc = _d_poc
+        color _c_poc = _s_poc > 0 ? _sgood : _s_poc < 0 ? _sbad : _sdim
+        string _v_poc = na(prev_poc) ? "sin datos" : _il ? (close > prev_poc ? "Sobre POC ant." : "Bajo POC ant.") : (close < prev_poc ? "Bajo POC ant." : "Sobre POC ant.")
+        table.cell(score_tbl, 0, 4, "PREV POC",      text_color=_scv,   bgcolor=_sb0, text_size=size.small)
+        table.cell(score_tbl, 1, 4, (_s_poc >= 0 ? "+" : "") + str.tostring(_s_poc), text_color=_c_poc, bgcolor=_sb0, text_size=size.small)
+        table.cell(score_tbl, 2, 4, _v_poc,          text_color=_c_poc, bgcolor=_sb0, text_size=size.small)
+
+        // ── Factor 5: Régimen ─────────────────────────────────────────────────────
+        int _s_reg = _d_regime
+        color _c_reg = _s_reg > 0 ? _sgood : _s_reg < 0 ? _sbad : _sdim
+        string _v_reg = not regime_ready ? "⏳ < 6 barras" : regime_trend ? "TENDENCIA" : regime_range ? "RANGO" : "MIXTO"
+        table.cell(score_tbl, 0, 5, "Régimen",       text_color=_scv,   bgcolor=_sb1, text_size=size.small)
+        table.cell(score_tbl, 1, 5, (_s_reg >= 0 ? "+" : "") + str.tostring(_s_reg), text_color=_c_reg, bgcolor=_sb1, text_size=size.small)
+        table.cell(score_tbl, 2, 5, _v_reg,          text_color=_c_reg, bgcolor=_sb1, text_size=size.small)
+
+        // ── Factor 6: CVD ─────────────────────────────────────────────────────────
+        int _s_cvd = _d_cvd
+        color _c_cvd = _s_cvd > 0 ? _sgood : _s_cvd < 0 ? _sbad : _sdim
+        string _v_cvd = cvd_strong ? "Fuerte " + str.tostring(math.round(cvd_pct_of_range)) + "%" : cvd_medium ? "Medio " + str.tostring(math.round(cvd_pct_of_range)) + "%" : "Débil " + str.tostring(math.round(cvd_pct_of_range)) + "%"
+        table.cell(score_tbl, 0, 6, "CVD",           text_color=_scv,   bgcolor=_sb0, text_size=size.small)
+        table.cell(score_tbl, 1, 6, (_s_cvd >= 0 ? "+" : "") + str.tostring(_s_cvd), text_color=_c_cvd, bgcolor=_sb0, text_size=size.small)
+        table.cell(score_tbl, 2, 6, _v_cvd,          text_color=_c_cvd, bgcolor=_sb0, text_size=size.small)
+
+        // ── Factor 7: Vela de señal ───────────────────────────────────────────────
+        int _s_cnd = _d_candle
+        color _c_cnd = _s_cnd > 0 ? _sgood : _s_cnd < 0 ? _sbad : _sdim
+        float _cb = math.abs(close - open)
+        float _cr = high - low
+        float _cratio = _cr > 0 ? math.round(_cb / _cr * 100) : 0.0
+        string _v_cnd = _sl ? "★ congelado" : "Cuerpo " + str.tostring(_cratio) + "%"
+        table.cell(score_tbl, 0, 7, "Vela",          text_color=_scv,   bgcolor=_sb1, text_size=size.small)
+        table.cell(score_tbl, 1, 7, (_s_cnd >= 0 ? "+" : "") + str.tostring(_s_cnd), text_color=_c_cnd, bgcolor=_sb1, text_size=size.small)
+        table.cell(score_tbl, 2, 7, _v_cnd,          text_color=_c_cnd, bgcolor=_sb1, text_size=size.small)
+
+        // ── Separador total ───────────────────────────────────────────────────────
+        table.cell(score_tbl, 0, 8, "──────",        text_color=_sdim, bgcolor=_sb0, text_size=size.tiny)
+        table.cell(score_tbl, 1, 8, "──",            text_color=_sdim, bgcolor=_sb0, text_size=size.tiny)
+        table.cell(score_tbl, 2, 8, "──────────────",text_color=_sdim, bgcolor=_sb0, text_size=size.tiny)
+
+        // ── Total y riesgo recomendado ────────────────────────────────────────────
+        table.cell(score_tbl, 0, 9,  "TOTAL",        text_color=_grade_col, bgcolor=_sb1, text_size=size.small)
+        table.cell(score_tbl, 1, 9,  (_total_score >= 0 ? "+" : "") + str.tostring(math.round(_total_score)) + " / 13", text_color=_grade_col, bgcolor=_sb1, text_size=size.normal)
+        table.cell(score_tbl, 2, 9,  _grade + "  " + f_setup_risk(_grade), text_color=_grade_col, bgcolor=_sb1, text_size=size.small)
+
+        // ── Riesgo recomendado ────────────────────────────────────────────────────
+        table.cell(score_tbl, 0, 10, "Riesgo",       text_color=_scv,  bgcolor=_sb0, text_size=size.small)
+        float _risk_rec = _grade == "A+" ? i_pmt_risk : _grade == "A" ? i_pmt_risk * 0.75 : _grade == "B" ? i_pmt_risk * 0.50 : 0.0
+        color _risk_col = _grade == "C" ? _sbad : _grade == "B" ? _sgold : _sgood
+        table.cell(score_tbl, 1, 10, "$" + str.tostring(math.round(_risk_rec)), text_color=_risk_col, bgcolor=_sb0, text_size=size.small)
+        table.cell(score_tbl, 2, 10, _grade == "C" ? "NO TOMAR" : "por trade", text_color=_risk_col, bgcolor=_sb0, text_size=size.small)
+
+        // ── Fila vacía ────────────────────────────────────────────────────────────
+        table.cell(score_tbl, 0, 11, "", bgcolor=_sb1)
+        table.cell(score_tbl, 1, 11, "", bgcolor=_sb1)
+        table.cell(score_tbl, 2, 11, "", bgcolor=_sb1)
+
+
+
+    0
+
+f_draw_score()
+// ═══════════════════════════════════════════════════════════════════════════════
+//  LIVE DASHBOARD — compacto, top_left
+//  Muestra: dirección, niveles, semáforo, qty, tiempo restante en ventana
+// ═══════════════════════════════════════════════════════════════════════════════
+var table live_tbl = table.new(position.middle_left, 2, 19,
+     bgcolor=color.new(#07090c, 5),
+     border_color=color.new(#1e3a4a, 0), border_width=1,
+     frame_color=color.new(#ff9d00, 60), frame_width=1)
+
+f_draw_live() =>
+    if barstate.islast and i_show_live and is_regular
+        color _lb0  = color.new(#07090c, 0)
+        color _lb1  = color.new(#0d1a24, 0)
+        color _lcv  = color.new(#c8d8e0, 0)
+        color _ldim = color.new(#3a5060, 0)
+        color _lgood = color.new(#00e5a0, 0)
+        color _lbad  = color.new(#ff3d5a, 0)
+        color _lgold = color.new(#ff9d00, 0)
+
+        // ── Calcular tiempo restante en ventana ───────────────────────────────────
+        // Ventana: desde 9:30 ET + blackout hasta 9:30 + close_window barras
+        int _bars_since_open = na(sess_bar) ? 0 : bar_index - sess_bar
+        int _bars_remaining  = math.max(0, i_close_window - _bars_since_open)
+        int _mins_remaining  = _bars_remaining * 5
+        bool _in_window      = _bars_remaining > 0 and _bars_since_open >= i_open_blackout
+        color _time_col      = _bars_remaining <= 3 ? _lbad : _bars_remaining <= 6 ? _lgold : _lgood
+        string _time_str     = _in_window ? str.tostring(_mins_remaining) + " min" : _bars_remaining == 0 ? "CERRADA" : "blackout"
+
+        // ── Qty estimado próxima señal ────────────────────────────────────────────
+        int _live_qty = not na(dyn_sl) and dyn_sl > 0 ? math.max(1, math.floor((i_pmt_risk / 2.0) / (dyn_sl * MNQ_PTS_VALUE))) : 1
+        float _live_risk = _live_qty * dyn_sl * MNQ_PTS_VALUE * 2.0  // riesgo real × 2 posiciones
+
+        // ── Header ────────────────────────────────────────────────────────────────
+        // Si hay trade activo siempre muestra TRADE ACTIVO aunque esté fuera de ventana
+        bool _has_active = sig_locked and not na(entry_price)
+        // Si hay trade activo siempre muestra TRADE ACTIVO aunque esté fuera de ventana
+        string _live_header = _has_active ? "⚡ TRADE ACTIVO" : _in_window ? "● EN VENTANA" : "○ FUERA VENTANA"
+        color  _live_hcol   = _has_active ? _lgood : _in_window ? color.new(#00d4ff,0) : _ldim
+        table.cell(live_tbl, 0, 0, _live_header, text_color=_live_hcol, bgcolor=_lb0, text_size=size.small)
+        table.cell(live_tbl, 1, 0, "", bgcolor=_lb0)
+        table.merge_cells(live_tbl, 0, 0, 1, 0)
+
+        // ── Dirección y modo ──────────────────────────────────────────────────────
+        if sig_locked and not na(entry_price)
+            bool   _lil = entry_dir == "LONG"
+            color  _ldc = _lil ? _lgood : _lbad
+            string _ldir = (_lil ? "▲ LONG" : "▼ SHORT") + "  " + entry_mode
+            // Usar fill real si fue ingresado, si no usar precio teórico
+            float _eff_entry = i_fill_real_top > 0 ? i_fill_real_top : entry_price
+            string _fill_tag = i_fill_real_top > 0 ? " ★fill" : " ~teórico"
+            table.cell(live_tbl, 0, 1, _ldir, text_color=_ldc, bgcolor=_lb1, text_size=size.normal)
+            table.cell(live_tbl, 1, 1, f_num(_eff_entry) + _fill_tag, text_color=_ldc, bgcolor=_lb1, text_size=size.normal)
+
+            // ── Niveles ───────────────────────────────────────────────────────────
+            float _e   = _eff_entry
+            float _sl  = entry_sl_pts
+            float _t05 = _lil ? _e + _sl * 0.5 : _e - _sl * 0.5
+            float _t1  = _lil ? _e + _sl * 1.0 : _e - _sl * 1.0
+            float _t2  = _lil ? _e + _sl * 2.0 : _e - _sl * 2.0
+            float _t3  = _lil ? _e + _sl * 3.0 : _e - _sl * 3.0
+            float _sl_p = _lil ? _e - _sl : _e + _sl
+
+            // Distancia actual a cada nivel
+            float _dist_sl  = math.abs(close - _sl_p)
+            float _dist_t05 = math.abs(close - _t05)
+            float _dist_t1  = math.abs(close - _t1)
+
+            // ── GESTIÓN DEL SL — trailing strategy óptima ───────────────────────
+            // Se actualiza automáticamente según el nivel que haya tocado el precio
+            // Basado en análisis matemático: BE buffer 10pts en 0.5R = E(trade) +$583
+
+            // Calcular el buffer de 10pts en la dirección correcta
+            float _buffer_pts = 10.0
+            float _be_buffer  = _lil ? _e - _buffer_pts : _e + _buffer_pts
+            float _sl_lock_1r = _lil ? _t1 - _buffer_pts : _t1 + _buffer_pts
+
+            // Determinar la acción actual según nivel tocado
+            string _sl_action    = ""
+            string _sl_detail    = ""
+            color  _sl_act_col   = _ldim
+            color  _sl_act_bg    = _lb1
+
+            // Gestión SL optimizada: 0.5R→nada | 1R→buffer15% | 1.5R→BE | 2R→lock0.75R
+            float _buf15    = _sl * 0.15
+            float _be_buf15 = _lil ? _e - _buf15 : _e + _buf15
+            float _lock075  = _lil ? _e + _sl * 0.75 : _e - _sl * 0.75
+
+            if not tr_hit_r1
+                // Antes de 1R: SL original, no mover aunque toque 0.5R
+                _sl_action  := "⏳ SL original — no mover"
+                _sl_detail  := f_num(_sl_p) + " ← mantener hasta 1R"
+                _sl_act_col := _ldim
+                _sl_act_bg  := _lb0
+
+            else if tr_hit_r1 and not tr_hit_r15
+                // Tocó 1R: mover SL a entry - SL×15%
+                _sl_action  := "🟡 MOVER SL → entry -" + str.tostring(math.round(_buf15, 1)) + "pts"
+                _sl_detail  := f_num(_be_buf15) + " (buffer proporcional 15%)"
+                _sl_act_col := _lgold
+                _sl_act_bg  := color.new(#ff9d00, 85)
+
+            else if tr_hit_r15 and not tr_hit_r2
+                // Tocó 1.5R: mover SL a BE exacto
+                _sl_action  := "🟢 MOVER SL → BE exacto"
+                _sl_detail  := f_num(_e) + " (entrada exacta)"
+                _sl_act_col := _lgood
+                _sl_act_bg  := color.new(#00e5a0, 85)
+
+            else if tr_hit_r2
+                // Tocó 2R: lock en 0.75R
+                _sl_action  := "🟢 MOVER SL → lock 0.75R"
+                _sl_detail  := f_num(_lock075) + " (asegura $" + str.tostring(math.round(i_pmt_risk * 0.75)) + ")"
+                _sl_act_col := _lgood
+                _sl_act_bg  := color.new(#00e5a0, 75)
+
+            // Mostrar la acción recomendada
+            table.cell(live_tbl, 0, 2, "Gestión SL", text_color=_lcv,      bgcolor=_lb0,      text_size=size.small)
+            table.cell(live_tbl, 1, 2, _sl_action,   text_color=_sl_act_col, bgcolor=_sl_act_bg, text_size=size.small)
+            table.cell(live_tbl, 0, 3, "→ Mover a",  text_color=_ldim,     bgcolor=_lb1,      text_size=size.tiny)
+            table.cell(live_tbl, 1, 3, _sl_detail,   text_color=_sl_act_col, bgcolor=_lb1,      text_size=size.tiny)
+
+            // ── Niveles de precio ────────────────────────────────────────────────
+            // Indicador visual de qué niveles ya tocó el precio
+            float _t15     = _lil ? _e + _sl * 1.5 : _e - _sl * 1.5
+            string _hit05  = tr_hit_r05  ? "✓" : "○"
+            string _hit1r  = tr_hit_r1   ? "✓" : "○"
+            string _hit15r = tr_hit_r15  ? "✓" : "○"
+            string _hit2r  = tr_hit_r2   ? "✓" : "○"
+            string _hit3r  = tr_hit_r3   ? "✓" : "○"
+            color  _c05    = tr_hit_r05  ? _lgood : _ldim
+            color  _c1r    = tr_hit_r1   ? _lgood : _ldim
+            color  _c15r   = tr_hit_r15  ? _lgood : _ldim
+            color  _c2r    = tr_hit_r2   ? _lgood : _ldim
+            color  _c3r    = tr_hit_r3   ? _lgood : _ldim
+
+            table.cell(live_tbl, 0, 4, "SL",                       text_color=_lbad,  bgcolor=_lb0, text_size=size.small)
+            table.cell(live_tbl, 1, 4, f_num(_sl_p) + "  (" + str.tostring(math.round(_dist_sl, 1)) + "pts)", text_color=_lbad, bgcolor=_lb0, text_size=size.small)
+            table.cell(live_tbl, 0, 5, _hit05  + " 0.5R  dejar correr",  text_color=_c05,  bgcolor=_lb1, text_size=size.small)
+            table.cell(live_tbl, 1, 5, f_num(_t05) + "  (" + str.tostring(math.round(_dist_t05, 1)) + "pts)", text_color=_c05, bgcolor=_lb1, text_size=size.small)
+            table.cell(live_tbl, 0, 6, _hit1r  + " 1R   SL -" + str.tostring(math.round(_sl * 0.15, 1)) + "pts", text_color=_c1r, bgcolor=_lb0, text_size=size.small)
+            table.cell(live_tbl, 1, 6, f_num(_t1) + "  (" + str.tostring(math.round(_dist_t1, 1)) + "pts)", text_color=_c1r, bgcolor=_lb0, text_size=size.small)
+            table.cell(live_tbl, 0, 7, _hit15r + " 1.5R  SL a BE",       text_color=_c15r, bgcolor=_lb1, text_size=size.small)
+            table.cell(live_tbl, 1, 7, f_num(_t15),                       text_color=_c15r, bgcolor=_lb1, text_size=size.small)
+            table.cell(live_tbl, 0, 8, _hit2r  + " 2R   lock 0.75R",     text_color=_c2r,  bgcolor=_lb0, text_size=size.small)
+            table.cell(live_tbl, 1, 8, f_num(_t2),                        text_color=_c2r,  bgcolor=_lb0, text_size=size.small)
+            table.cell(live_tbl, 0, 9, _hit3r  + " 3R   cerrar todo",    text_color=_lgood, bgcolor=_lb1, text_size=size.small)
+            table.cell(live_tbl, 1, 9, f_num(_t3),                        text_color=_lgood, bgcolor=_lb1, text_size=size.small)
+
+            // ── CVD intrabar — barra visual en tiempo real ───────────────────────
+            // Cambio del CVD desde la entrada del trade
+            float _cvd_now    = cvd
+            float _cvd_entry  = not na(entry_cvd) ? entry_cvd : _cvd_now
+            float _cvd_delta  = _cvd_now - _cvd_entry
+            float _cvd_range  = math.abs(_cvd_entry) > 0 ? math.abs(_cvd_entry) : 1.0
+            float _cvd_pct    = math.round(_cvd_delta / _cvd_range * 100)
+
+            // Dirección del CVD relativa al trade
+            bool _cvd_favor   = _lil ? _cvd_delta > 0 : _cvd_delta < 0
+            bool _cvd_contra  = _lil ? _cvd_delta < 0 : _cvd_delta > 0
+
+            // Barra visual proporcional (máx 10 bloques)
+            float _cvd_abs_pct = math.min(math.abs(_cvd_pct), 100.0)
+            int   _cvd_blocks  = math.round(_cvd_abs_pct / 10)
+            string _cvd_bar    = ""
+            for _b = 0 to 9
+                _cvd_bar := _cvd_bar + (_b < _cvd_blocks ? "█" : "░")
+
+            // Sostenido intrabar (últimas 3 barras)
+            bool _cvd_up_now = _lil ? cvd_rising_sustained : cvd_falling_sustained
+            bool _cvd_dn_now = _lil ? cvd_falling_sustained : cvd_rising_sustained
+
+            // Color según dirección
+            color _cvd_bar_col = _cvd_favor ? _lgood : _cvd_contra ? _lbad : _ldim
+            string _cvd_trend  = _cvd_up_now ? " ↑" : _cvd_dn_now ? " ↓" : " →"
+            // % del rango diario — convicción del CVD
+            string _cvd_conv_str = cvd_strong ? "fuerte" : cvd_medium ? "medio" : "⚠ débil"
+            color  _cvd_conv_col = cvd_strong ? _lgood : cvd_medium ? _lgold : _lbad
+            string _cvd_pct_str  = (_cvd_pct >= 0 ? "+" : "") + str.tostring(math.round(_cvd_pct)) + "%" + _cvd_trend + "  " + str.tostring(math.round(cvd_pct_of_range)) + "% rango"
+
+            // ── Separador gestión SL ─────────────────────────────────────────────
+            table.cell(live_tbl, 0, 9, "──────", text_color=_ldim, bgcolor=_lb0, text_size=size.tiny)
+            table.cell(live_tbl, 1, 9, "CVD vs entrada", text_color=_ldim, bgcolor=_lb0, text_size=size.tiny)
+
+            // Barra visual CVD
+            table.cell(live_tbl, 0, 10, _cvd_bar,    text_color=_cvd_bar_col, bgcolor=_lb1, text_size=size.small)
+            table.cell(live_tbl, 1, 10, _cvd_pct_str, text_color=_cvd_bar_col, bgcolor=_lb1, text_size=size.small)
+
+            // Estado sostenido + convicción
+            string _sost_str = _cvd_up_now ? "✓ sostenido a favor" : _cvd_dn_now ? "✗ en contra" : "~ lateral"
+            color  _sost_col = _cvd_up_now ? _lgood : _cvd_dn_now ? _lbad : _ldim
+            table.cell(live_tbl, 0, 11, "CVD",      text_color=_lcv,   bgcolor=_lb0, text_size=size.small)
+            table.cell(live_tbl, 1, 11, _sost_str + "  " + str.tostring(math.round(cvd_pct_of_range)) + "%", text_color=_sost_col, bgcolor=_lb0, text_size=size.small)
+
+            // Alerta convicción baja
+            if cvd_weak
+                table.cell(live_tbl, 0, 12, "⚠ CVD",     text_color=_lbad, bgcolor=color.new(#ff3d5a, 80), text_size=size.small)
+                table.cell(live_tbl, 1, 12, "débil " + str.tostring(math.round(cvd_pct_of_range)) + "% — riesgo reversión 0.5R", text_color=_lbad, bgcolor=color.new(#ff3d5a, 80), text_size=size.small)
+            else
+                table.cell(live_tbl, 0, 12, "CVD conv.", text_color=_lcv,      bgcolor=_lb1, text_size=size.small)
+                table.cell(live_tbl, 1, 12, _cvd_conv_str + " (" + str.tostring(math.round(cvd_pct_of_range)) + "%)", text_color=_cvd_conv_col, bgcolor=_lb1, text_size=size.small)
+
+            // ── Estado runner ESTABILIZADO — no cambia tick a tick ───────────────────
+            // Se actualiza solo al cierre de cada vela 5M
+            // Excepción única: precio rompió 0.5R → cierre inmediato intrabar
+            bool _price_broke_05 = _lil ? close < _t05 : close > _t05
+
+            string _r_display = _price_broke_05 ? "🔴 CERRAR — rompió 0.5R" : runner_state_str
+            color  _r_disp_col = _price_broke_05 ? _lbad : runner_state_color
+            string _r_score_str = "score " + str.tostring(runner_score) + "  |  actualiza al cierre"
+
+            table.cell(live_tbl, 0, 13, "Runner",      text_color=_lcv,      bgcolor=_lb1, text_size=size.small)
+            table.cell(live_tbl, 1, 13, _r_display,    text_color=_r_disp_col, bgcolor=_lb1, text_size=size.normal)
+            table.cell(live_tbl, 0, 14, "",            bgcolor=_lb0)
+            table.cell(live_tbl, 1, 14, _r_score_str,  text_color=_ldim,     bgcolor=_lb0, text_size=size.tiny)
+
+            // ── VWAP diario ───────────────────────────────────────────────────────
+            bool _vwap_favor  = _lil ? price_above_vwap : price_below_vwap
+            bool _vwap_contra = _lil ? price_below_vwap : price_above_vwap
+            string _vwap_str  = na(vwap_daily) ? "sin datos" : (_vwap_favor ? "✓ a favor (" + str.tostring(dist_to_vwap) + "pts)" : _vwap_contra ? "✗ en contra (" + str.tostring(dist_to_vwap) + "pts)" : "~ en VWAP")
+            color  _vwap_col  = na(vwap_daily) ? _ldim : (_vwap_favor ? _lgood : _vwap_contra ? _lbad : _lgold)
+            table.cell(live_tbl, 0, 15, "VWAP",    text_color=_lcv,     bgcolor=_lb0, text_size=size.small)
+            table.cell(live_tbl, 1, 15, _vwap_str, text_color=_vwap_col, bgcolor=_lb0, text_size=size.small)
+
+            // ── Setup grade del trade activo ─────────────────────────────────────
+            string _active_grade = _lil ? _grade_long : _grade_short
+            color  _active_gcol  = f_setup_color(_active_grade)
+            table.cell(live_tbl, 0, 16, "Setup",   text_color=_lcv,       bgcolor=_lb1, text_size=size.small)
+            table.cell(live_tbl, 1, 16, _active_grade + "  " + regime_type, text_color=_active_gcol, bgcolor=_lb1, text_size=size.small)
+
+            // ── Tiempo restante ───────────────────────────────────────────────────
+            table.cell(live_tbl, 0, 17, "Ventana", text_color=_lcv,      bgcolor=_lb0, text_size=size.small)
+            table.cell(live_tbl, 1, 17, _time_str,  text_color=_time_col, bgcolor=_lb0, text_size=size.small)
+
+            // ── Fila vacía ────────────────────────────────────────────────────────
+            table.cell(live_tbl, 0, 18, "", bgcolor=_lb1)
+            table.cell(live_tbl, 1, 18, "", bgcolor=_lb1)
+
+        else
+            // ── Sin trade activo: mostrar próxima señal potencial ─────────────────
+            color _pot_col = pot_long ? _lgood : pot_short ? _lbad : _ldim
+            string _pot_str = pot_long ? "▲ LONG " + (pot_long_tf ? "TF" : "MR") : pot_short ? "▼ SHORT " + (pot_short_tf ? "TF" : "MR") : "—"
+            table.cell(live_tbl, 0, 1, "Setup", text_color=_lcv, bgcolor=_lb1, text_size=size.small)
+            table.cell(live_tbl, 1, 1, _pot_str, text_color=_pot_col, bgcolor=_lb1, text_size=size.small)
+
+            // ── SL estimado y qty ─────────────────────────────────────────────────
+            table.cell(live_tbl, 0, 2, "SL est.", text_color=_lcv, bgcolor=_lb0, text_size=size.small)
+            table.cell(live_tbl, 1, 2, f_num(dyn_sl) + "pts  " + (sl_valid ? "✓" : "✗ alto"), text_color=sl_valid ? _lgold : _lbad, bgcolor=_lb0, text_size=size.small)
+            table.cell(live_tbl, 0, 3, "Qty", text_color=_lcv, bgcolor=_lb1, text_size=size.small)
+            table.cell(live_tbl, 1, 3, str.tostring(_live_qty) + " MNQ × 2 pos", text_color=_lgold, bgcolor=_lb1, text_size=size.small)
+            table.cell(live_tbl, 0, 4, "Riesgo", text_color=_lcv, bgcolor=_lb0, text_size=size.small)
+            table.cell(live_tbl, 1, 4, "$" + str.tostring(math.round(_live_risk)), text_color=_lgold, bgcolor=_lb0, text_size=size.small)
+
+            // ── Ventana ───────────────────────────────────────────────────────────
+            table.cell(live_tbl, 0, 5, "Ventana", text_color=_lcv, bgcolor=_lb1, text_size=size.small)
+            table.cell(live_tbl, 1, 5, _time_str, text_color=_time_col, bgcolor=_lb1, text_size=size.small)
+
+            // ── CVD estado ───────────────────────────────────────────────────────
+            bool _cvd_up = cvd_rising_sustained
+            bool _cvd_dn = cvd_falling_sustained
+            string _cvd_str = _cvd_up ? "↑ alcista" : _cvd_dn ? "↓ bajista" : "~ neutral"
+            color  _cvd_col = _cvd_up ? _lgood : _cvd_dn ? _lbad : _ldim
+            table.cell(live_tbl, 0, 6, "CVD", text_color=_lcv, bgcolor=_lb0, text_size=size.small)
+            table.cell(live_tbl, 1, 6, _cvd_str, text_color=_cvd_col, bgcolor=_lb0, text_size=size.small)
+
+            // ── VWAP contexto ─────────────────────────────────────────────────────
+            string _vwap_ctx2 = na(vwap_daily) ? "sin datos" : price_above_vwap ? "↑ sobre VWAP (" + str.tostring(dist_to_vwap) + "pts)" : "↓ bajo VWAP (" + str.tostring(dist_to_vwap) + "pts)"
+            color  _vwap_ctx2_col = na(vwap_daily) ? _ldim : price_above_vwap ? _lgood : _lbad
+            table.cell(live_tbl, 0, 7, "VWAP",    text_color=_lcv,        bgcolor=_lb1, text_size=size.small)
+            table.cell(live_tbl, 1, 7, _vwap_ctx2, text_color=_vwap_ctx2_col, bgcolor=_lb1, text_size=size.small)
+
+            // ── Régimen intraday ──────────────────────────────────────────────────
+            table.cell(live_tbl, 0, 8, "Régimen",  text_color=_lcv,       bgcolor=_lb0, text_size=size.small)
+            table.cell(live_tbl, 1, 8, regime_type, text_color=regime_color, bgcolor=_lb0, text_size=size.small)
+
+            // ── Volatilidad de sesión ─────────────────────────────────────────────
+            string _vol_pts = sess_atr_count < 3 ? "calc..." : str.tostring(math.round(sess_atr, 1)) + "pts"
+            string _vol_str = _vol_pts + "  " + vol_regime
+            table.cell(live_tbl, 0, 15, "Vol ATR",   text_color=_lcv,           bgcolor=_lb1, text_size=size.small)
+            color _vol_bg = vol_too_high ? color.new(#ff3d5a, 80) : _lb1
+            table.cell(live_tbl, 1, 15, _vol_str, text_color=vol_regime_col, bgcolor=_vol_bg, text_size=size.small)
+
+            // ── Sesgo de período — directamente después del régimen ───────────────
+            color  _bias_live_col = period_bias_bull ? _lgood : period_bias_bear ? _lbad : _lgold
+            color  _eff_live_col  = effective_dir == "Solo LONG" ? _lgood : effective_dir == "Solo SHORT" ? _lbad : _ldim
+            string _eff_live_str  = effective_dir == "Solo LONG" ? "▲ Solo LONG" : effective_dir == "Solo SHORT" ? "▼ Solo SHORT" : "▲▼ Ambas"
+            table.cell(live_tbl, 0, 16, "Sesgo",        text_color=_lcv,            bgcolor=_lb1, text_size=size.small)
+            table.cell(live_tbl, 1, 16, period_bias_str + "  " + period_bias_detail, text_color=_bias_live_col, bgcolor=_lb1, text_size=size.small)
+
+            // ── Setup LONG y SHORT — sincronizado con señal técnica ───────────────
+            // Si hay señal técnica activa → resaltar esa dirección
+            bool _has_long_sig = long_sig or test_long_sig
+            bool _has_short_sig = short_sig or test_short_sig
+            bool _sig_direction_long = _has_long_sig and not _has_short_sig
+            bool _sig_direction_short = _has_short_sig and not _has_long_sig
+
+            color _gl_col = f_setup_color(_grade_long)
+            color _gs_col = f_setup_color(_grade_short)
+
+            // Resaltar la dirección de la señal activa con borde brillante
+            color _gl_bg = _sig_direction_long  ? color.new(#00e5a0, 75) : _lb1
+            color _gs_bg = _sig_direction_short ? color.new(#ff3d5a, 75) : _lb0
+
+            string _long_label  = _sig_direction_long  ? "▲ LONG  ← SEÑAL" : "▲ LONG"
+            string _short_label = _sig_direction_short ? "▼ SHORT ← SEÑAL" : "▼ SHORT"
+
+            table.cell(live_tbl, 0, 9,  _long_label,  text_color=_sig_direction_long  ? _lgood : color.new(_lgood, 40), bgcolor=_gl_bg, text_size=size.small)
+            table.cell(live_tbl, 1, 9,  _grade_long  + "  " + f_setup_risk(_grade_long),  text_color=_gl_col, bgcolor=_gl_bg, text_size=size.small)
+            table.cell(live_tbl, 0, 10, _short_label, text_color=_sig_direction_short ? _lbad  : color.new(_lbad,  40), bgcolor=_gs_bg, text_size=size.small)
+            table.cell(live_tbl, 1, 10, _grade_short + "  " + f_setup_risk(_grade_short), text_color=_gs_col, bgcolor=_gs_bg, text_size=size.small)
+
+            // ── Desglose de factores — sincronizado con señal técnica ─────────────
+            // Mostrar factores de la dirección de la señal activa
+            // Si no hay señal → mostrar la de mejor grade
+            bool _show_long = _sig_direction_long ? true : _sig_direction_short ? false : _setup_score_long >= _setup_score_short
+            string _f1 = _show_long ? (price_above_vwap ? "VWAP ✓" : "VWAP ✗") : (price_below_vwap ? "VWAP ✓" : "VWAP ✗")
+            string _f2 = _show_long ? (very_near_major_high ? "Struct ✗✗" : near_major_high ? "Struct ✗" : "Struct ✓") : (very_near_major_low ? "Struct ✗✗" : near_major_low ? "Struct ✗" : "Struct ✓")
+            string _f3 = not orb_set ? "ORB ⏳" : (_show_long and price_above_orb) or (not _show_long and price_below_orb) ? "ORB ✓" : price_in_orb ? "ORB ~" : "ORB ✗"
+            string _f4 = na(prev_poc) ? "POC ?" : (_show_long and close > prev_poc) or (not _show_long and close < prev_poc) ? "POC ✓" : "POC ✗"
+            string _f5 = _show_long ? (regime_trend ? "TF ✓" : regime_range ? "Rng ✗" : "Mix ~") : (regime_trend ? "TF ✗" : regime_range ? "Rng ✓" : "Mix ~")
+            string _factors = _f1 + "  " + _f2 + "  " + _f3 + "  " + _f4 + "  " + _f5
+            table.cell(live_tbl, 0, 11, "Factores", text_color=_ldim,  bgcolor=_lb1, text_size=size.tiny)
+            table.cell(live_tbl, 1, 11, _factors,   text_color=_ldim,  bgcolor=_lb1, text_size=size.tiny)
+
+            // ── ORB niveles ───────────────────────────────────────────────────────
+            string _orb_str = not orb_set ? "⏳ calculando (< 30 min)" : f_num(orb_low) + " — " + f_num(orb_high)
+            color  _orb_col = not orb_set ? _ldim : price_above_orb ? _lgood : price_below_orb ? _lbad : _lgold
+            table.cell(live_tbl, 0, 12, "ORB",     text_color=_lcv,   bgcolor=_lb0, text_size=size.small)
+            table.cell(live_tbl, 1, 12, _orb_str,  text_color=_orb_col, bgcolor=_lb0, text_size=size.small)
+
+            // ── Filas vacías ──────────────────────────────────────────────────────
+            for _lv = 13 to 15
+                table.cell(live_tbl, 0, _lv, "", bgcolor=_lb1)
+                table.cell(live_tbl, 1, _lv, "", bgcolor=_lb1)
+
+
+
+    0
+
+f_draw_live()
+var int exhaust_start_time = 0
+var int exhaust_bar_id     = -1
+
+if bar_index != exhaust_bar_id
+    exhaust_start_time := 0
+    exhaust_bar_id     := bar_index
+
+bool exhaust_long  = sig_locked and entry_dir == "LONG"  and (bear_delta or cvd_falling_sustained)
+bool exhaust_short = sig_locked and entry_dir == "SHORT" and (bull_delta or cvd_rising_sustained)
+bool exhausting    = exhaust_long or exhaust_short
+
+if exhausting and exhaust_start_time == 0
+    exhaust_start_time := timenow
+if not exhausting
+    exhaust_start_time := 0
+
+var table setup_tbl = table.new(position.bottom_right, 2, 16,
+     bgcolor=color.new(#07090c, 5),
+     border_color=color.new(#1e3a4a, 0), border_width=1,
+     frame_color=color.new(#ff9d00, 60), frame_width=1)
+
+f_draw_setup() =>
+    if barstate.islast and is_regular and i_show_setup
+        color _bg0 = color.new(#07090c, 0)
+        color _cv  = color.new(#c8d8e0, 0)
+
+        if sig_locked and not na(entry_price)
+            string _dir = entry_dir == "LONG" ? "▲ LONG" : "▼ SHORT"
+            color  _dc  = entry_dir == "LONG" ? color.new(#00e5a0,0) : color.new(#ff3d5a,0)
+            bool   _il  = entry_dir == "LONG"
+
+            bool _rev_div   = _il ? bear_div  : bull_div
+            bool _rev_cvd   = _il ? cvd_falling_sustained : cvd_rising_sustained
+            bool _rev_dlt   = _il ? bear_delta : bull_delta
+            int  _rev_score = (_rev_div ? 1 : 0) + (_rev_cvd ? 1 : 0) + (_rev_dlt ? 1 : 0)
+
+            float _cvd_change     = _il ? (cvd - entry_cvd) : (entry_cvd - cvd)
+            float _cvd_change_pct = not na(entry_cvd) and math.abs(entry_cvd) > 0 ? math.round(_cvd_change / math.abs(entry_cvd) * 100) : 0
+            string _cvd_deg_str   = not na(entry_cvd) ? " cvd:" + str.tostring(_cvd_change_pct) + "%" : ""
+            bool   _cvd_exit      = not na(entry_cvd) and _cvd_change < 0 and math.abs(_cvd_change) > math.abs(entry_cvd) * (i_cvd_exit_pct / 100)
+
+            color  _rev_col = _cvd_exit ? color.new(#ff3d5a,0) : _rev_score >= 2 ? color.new(#ff3d5a,0) : _rev_score == 1 ? color.new(#ff9d00,0) : color.new(#00e5a0,0)
+            string _rev_txt = _cvd_exit ? "🔴 SALIR — CVD revirtió" : _rev_score >= 2 ? "⚠ AGOTAMIENTO" : _rev_score == 1 ? "~ vigilar" : "✓ momentum ok"
+
+            // ── Header trade activo ───────────────────────────────────────────────
+            table.cell(setup_tbl, 0, 0, "🟢 TRADE ACTIVO", text_color=_dc, bgcolor=_bg0, text_size=size.small)
+            float _s_eff = i_fill_real_top > 0 ? i_fill_real_top : entry_price
+            string _s_tag = i_fill_real_top > 0 ? " ★" : ""
+            table.cell(setup_tbl, 1, 0, _dir + "  " + entry_mode + "  " + f_num(_s_eff) + _s_tag, text_color=_dc, bgcolor=_bg0, text_size=size.small)
+
+            // ── Niveles ───────────────────────────────────────────────────────────
+            table.cell(setup_tbl, 0, 1, "SL",  text_color=color.new(#ff3d5a,0), bgcolor=_bg0, text_size=size.small)
+            table.cell(setup_tbl, 1, 1, f_num(entry_sl) + "  (" + f_num(entry_sl_pts) + "pts)", text_color=_cv, bgcolor=_bg0, text_size=size.small)
+            table.cell(setup_tbl, 0, 2, "1R ← PMT", text_color=color.new(#00e5a0,0), bgcolor=_bg0, text_size=size.small)
+            table.cell(setup_tbl, 1, 2, f_num(entry_tp1), text_color=color.new(#00e5a0,0), bgcolor=_bg0, text_size=size.small)
+            table.cell(setup_tbl, 0, 3, "2R", text_color=color.new(#00e5a0,40), bgcolor=_bg0, text_size=size.small)
+            table.cell(setup_tbl, 1, 3, f_num(entry_tp2), text_color=color.new(#00e5a0,40), bgcolor=_bg0, text_size=size.small)
+            table.cell(setup_tbl, 0, 4, "3R", text_color=color.new(#00e5a0,60), bgcolor=_bg0, text_size=size.small)
+            table.cell(setup_tbl, 1, 4, f_num(entry_tp3), text_color=color.new(#00e5a0,60), bgcolor=_bg0, text_size=size.small)
+
+            // ── Separador semáforo ────────────────────────────────────────────────
+            color _sep_bg = near_tp1 ? color.new(#ff9d00, 60) : _bg0
+            table.cell(setup_tbl, 0, 5, near_tp1 ? "⚡ ZONA 1R" : "──────", text_color=near_tp1 ? color.new(#ff9d00,0) : color.new(#3a5060,0), bgcolor=_sep_bg, text_size=size.small)
+            table.cell(setup_tbl, 1, 5, near_tp1 ? "precio cerca de TP1" : "──────",          text_color=near_tp1 ? color.new(#ff9d00,0) : color.new(#3a5060,0), bgcolor=_sep_bg, text_size=size.small)
+
+            // ── Semáforo de continuación ──────────────────────────────────────────
+            table.cell(setup_tbl, 0, 6, "CVD sostenido",   text_color=_cv,           bgcolor=_bg0, text_size=size.small)
+            table.cell(setup_tbl, 1, 6, sem_cvd  ? "✓" : "✗", text_color=f_col(sem_cvd),  bgcolor=_bg0, text_size=size.small)
+
+            table.cell(setup_tbl, 0, 7, "Delta fuerte",    text_color=_cv,           bgcolor=_bg0, text_size=size.small)
+            table.cell(setup_tbl, 1, 7, sem_delta ? "✓" : "✗", text_color=f_col(sem_delta), bgcolor=_bg0, text_size=size.small)
+
+            table.cell(setup_tbl, 0, 8, "Vela con cuerpo", text_color=_cv,           bgcolor=_bg0, text_size=size.small)
+            string _body_str = sem_body_curr and sem_body_prev ? "✓ actual+prev" : sem_body_curr ? "~ solo actual" : sem_body_prev ? "~ solo prev" : "✗"
+            color  _body_col = sem_body ? color.new(#00e5a0,0) : (sem_body_curr or sem_body_prev) ? color.new(#ff9d00,0) : color.new(#ff3d5a,0)
+            table.cell(setup_tbl, 1, 8, _body_str,         text_color=_body_col,     bgcolor=_bg0, text_size=size.small)
+
+            // ── Decisión final ────────────────────────────────────────────────────
+            table.cell(setup_tbl, 0, 9, str.tostring(sem_score) + "/3", text_color=sem_color, bgcolor=_bg0, text_size=size.small)
+            table.cell(setup_tbl, 1, 9, sem_decision,                   text_color=sem_color, bgcolor=_bg0, text_size=size.normal)
+
+            // ── Separador momentum histórico ──────────────────────────────────────
+            table.cell(setup_tbl, 0, 10, "──────", text_color=color.new(#3a5060,0), bgcolor=_bg0, text_size=size.small)
+            table.cell(setup_tbl, 1, 10, "──────", text_color=color.new(#3a5060,0), bgcolor=_bg0, text_size=size.small)
+
+            // ── CVD degradación desde entry ───────────────────────────────────────
+            table.cell(setup_tbl, 0, 11, _rev_txt, text_color=_rev_col, bgcolor=_bg0, text_size=size.small)
+            table.cell(setup_tbl, 1, 11, f_check(_rev_div) + " div  " + f_check(_rev_cvd) + " cvd  " + f_check(_rev_dlt) + " dlt" + _cvd_deg_str, text_color=_rev_col, bgcolor=_bg0, text_size=size.small)
+
+            // ── Filas vacías restantes ────────────────────────────────────────────
+            for _empty = 12 to 15
+                table.cell(setup_tbl, 0, _empty, "", bgcolor=_bg0)
+                table.cell(setup_tbl, 1, _empty, "", bgcolor=_bg0)
+
+        else if freq_ok
+            bool _is_long = pot_long
+            bool _is_mr   = pot_long_mr or pot_short_mr
+            bool _any     = pot_long or pot_short
+
+            string _dir  = pot_long ? "▲ LONG" : pot_short ? "▼ SHORT" : "—"
+            string _mode = _is_mr ? "MR" : (pot_long_tf or pot_short_tf) ? "TF" : "—"
+            color  _dc   = pot_long ? color.new(#00e5a0,0) : pot_short ? color.new(#ff3d5a,0) : color.new(#3a5060,0)
+
+            table.cell(setup_tbl, 0, 0, _any ? "● SETUP  " + _dir + "  " + _mode : "○ Sin setup",
+                       text_color=_any ? _dc : color.new(#3a5060,0), bgcolor=_bg0, text_size=size.small)
+            table.cell(setup_tbl, 1, 0, "", bgcolor=_bg0)
+            table.merge_cells(setup_tbl, 0, 0, 1, 0)
+
+            // ATR info siempre visible
+            table.cell(setup_tbl, 0, 1, "ATR SL", text_color=color.new(#ff9d00,0), bgcolor=_bg0, text_size=size.small)
+            table.cell(setup_tbl, 1, 1, f_num(dyn_sl) + "pts  qty:" + str.tostring(dyn_qty) + "  " + (sl_valid ? "✓" : "✗ ATR alto"), text_color=sl_valid ? color.new(#ff9d00,0) : color.new(#ff3d5a,0), bgcolor=_bg0, text_size=size.small)
+
+            if _any
+                bool _c1 = _is_mr ? (_is_long ? near_val : near_vah) : (_is_long ? above_prev_va_confirmed : below_prev_va_confirmed)
+                string _c1t = _is_mr ? (_is_long ? "Cerca VAL" : "Cerca VAH") : (_is_long ? "5M cerró > VAH" : "5M cerró < VAL")
+                table.cell(setup_tbl, 0, 2, f_check(_c1), text_color=f_col(_c1), bgcolor=_bg0, text_size=size.small)
+                table.cell(setup_tbl, 1, 2, _c1t, text_color=_cv, bgcolor=_bg0, text_size=size.small)
+
+                bool _c2 = _is_mr ? (_is_long ? bull_div : bear_div) : false
+                string _c2t = _is_mr ? (_is_long ? "Div ▲CVD" : "Div ▼CVD") : "Div CVD (solo MR)"
+                table.cell(setup_tbl, 0, 3, _is_mr ? f_check(_c2) : "—", text_color=_is_mr ? f_col(_c2) : color.new(#3a5060,0), bgcolor=_bg0, text_size=size.small)
+                table.cell(setup_tbl, 1, 3, _c2t, text_color=_cv, bgcolor=_bg0, text_size=size.small)
+
+                bool _c3 = _is_long ? cvd_rising_sustained : cvd_falling_sustained
+                table.cell(setup_tbl, 0, 4, f_check(_c3), text_color=f_col(_c3), bgcolor=_bg0, text_size=size.small)
+                table.cell(setup_tbl, 1, 4, "CVD sostenido", text_color=_cv, bgcolor=_bg0, text_size=size.small)
+
+                bool _c4 = _is_long ? bull_delta : bear_delta
+                table.cell(setup_tbl, 0, 5, f_check(_c4), text_color=f_col(_c4), bgcolor=_bg0, text_size=size.small)
+                table.cell(setup_tbl, 1, 5, "Delta actual", text_color=_cv, bgcolor=_bg0, text_size=size.small)
+
+                bool _c5 = _is_long ? bull_delta_sustained : bear_delta_sustained
+                table.cell(setup_tbl, 0, 6, f_check(_c5), text_color=f_col(_c5), bgcolor=_bg0, text_size=size.small)
+                table.cell(setup_tbl, 1, 6, "Delta anterior", text_color=_cv, bgcolor=_bg0, text_size=size.small)
+
+                bool _c6 = _is_long ? delta_consistent_bull : delta_consistent_bear
+                table.cell(setup_tbl, 0, 7, f_check(_c6), text_color=f_col(_c6), bgcolor=_bg0, text_size=size.small)
+                table.cell(setup_tbl, 1, 7, "Delta 3 velas", text_color=_cv, bgcolor=_bg0, text_size=size.small)
+
+                int _total  = _is_mr ? 6 : 5
+                int _checks = (_c1 ? 1 : 0) + (_is_mr and _c2 ? 1 : 0) + (_c3 ? 1 : 0) + (_c4 ? 1 : 0) + (_c5 ? 1 : 0) + (_c6 ? 1 : 0)
+                color  _rc  = _checks >= _total ? color.new(#00e5a0,0) : _checks >= _total - 2 ? color.new(#ff9d00,0) : color.new(#ff3d5a,0)
+                string _rt  = _checks >= _total ? "🔥 LISTO" : str.tostring(_checks) + "/" + str.tostring(_total)
+                table.cell(setup_tbl, 0, 8, _rt, text_color=_rc, bgcolor=_bg0, text_size=size.small)
+                table.cell(setup_tbl, 1, 8, "", bgcolor=_bg0)
+                table.merge_cells(setup_tbl, 0, 8, 1, 8)
+            else
+                for _r = 2 to 8
+                    table.cell(setup_tbl, 0, _r, "", bgcolor=_bg0)
+                    table.cell(setup_tbl, 1, _r, "", bgcolor=_bg0)
+        else
+            for _r = 0 to 8
+                table.cell(setup_tbl, 0, _r, "", bgcolor=_bg0)
+                table.cell(setup_tbl, 1, _r, "", bgcolor=_bg0)
+
+    0
+
+f_draw_setup()
+// ═══════════════════════════════════════════════════════════════════════════════
+//  DASHBOARD BT — Win Rate por R (bottom left)
+//  WR = trades que tocaron 1R / total cerrados
+//  Muestra: sesión actual + acumulado histórico
+// ═══════════════════════════════════════════════════════════════════════════════
+f_pct(num, den) =>
+    den > 0 ? str.tostring(math.round(float(num) / float(den) * 100)) + "%" : "—"
+
+f_r_bar(hits, total) =>
+    // Barra de progreso visual con █ characters
+    pct = total > 0 ? math.round(float(hits) / float(total) * 10) : 0
+    bar = ""
+    for i = 0 to 9
+        bar := bar + (i < pct ? "█" : "░")
+    bar
+
+var table bt_tbl = table.new(position.bottom_left, 3, 37,
+     bgcolor=color.new(#07090c, 5),
+     border_color=color.new(#1e3a4a, 0), border_width=1,
+     frame_color=color.new(#00d4ff, 60), frame_width=1)
+
+f_draw_bt() =>
+    if barstate.islast and i_show_bt
+        color _bg0  = color.new(#07090c, 0)
+        color _bg1  = color.new(#0d1a24, 0)
+        color _cv   = color.new(#c8d8e0, 0)
+        color _dim  = color.new(#3a5060, 0)
+        color _gold = color.new(#ff9d00, 0)
+        color _info = color.new(#00d4ff, 0)
+        color _good = color.new(#00e5a0, 0)
+        color _bad  = color.new(#ff3d5a, 0)
+
+        // ── Header ────────────────────────────────────────────────────────────────
+        table.cell(bt_tbl, 0, 0, "BT / WR",    text_color=_info, bgcolor=_bg0, text_size=size.small)
+        table.cell(bt_tbl, 1, 0, "SESIÓN",     text_color=_dim,  bgcolor=_bg0, text_size=size.small)
+        table.cell(bt_tbl, 2, 0, "ACUMULADO",  text_color=_dim,  bgcolor=_bg0, text_size=size.small)
+
+        // ── Trades totales ─────────────────────────────────────────────────────────
+        table.cell(bt_tbl, 0, 1, "Trades",     text_color=_cv,   bgcolor=_bg1, text_size=size.small)
+        table.cell(bt_tbl, 1, 1, str.tostring(ss_total), text_color=_cv, bgcolor=_bg1, text_size=size.small)
+        table.cell(bt_tbl, 2, 1, str.tostring(ac_total), text_color=_cv, bgcolor=_bg1, text_size=size.small)
+
+        // ── WR según modo activo ──────────────────────────────────────────────────
+        // Modo honesto PMT: WR real = llegaron a 3R / total
+        // Otros modos: WR = llegaron a 1R / total (referencia)
+        bool _honest_3r  = i_exit_mode == "TP en 3R honesto (PMT)"
+        bool _honest_2r  = i_exit_mode == "TP en 2R honesto (PMT)"
+        bool _honest_be  = i_exit_mode == "BE en 0.5R + runner a 3R"
+        bool _honest_05r = i_exit_mode == "50% en 0.5R + 50% libre" or i_exit_mode == "50% en 0.5R + runner en 1R" or i_exit_mode == "50% en 0.5R + runner promedio"
+        int  _ac_wr_n = _honest_3r ? ac_r3 : _honest_2r ? ac_r2 : _honest_be ? ac_r3 : _honest_05r ? ac_r05 : ac_r1
+        int  _ss_wr_n = _honest_3r ? ss_r3 : _honest_2r ? ss_r2 : _honest_be ? ss_r3 : _honest_05r ? ss_r05 : ss_r1
+        string _wr_label = _honest_3r ? "WR (3R)" : _honest_2r ? "WR (2R)" : _honest_be ? "WR (3R+BE)" : _honest_05r ? "WR (0.5R)" : "WR (1R)"
+        ss_wr_col = ss_total > 0 ? (float(_ss_wr_n)/float(ss_total) >= 0.5 ? _good : _bad) : _dim
+        ac_wr_col = ac_total > 0 ? (float(_ac_wr_n)/float(ac_total) >= 0.5 ? _good : _bad) : _dim
+        table.cell(bt_tbl, 0, 2, _wr_label,    text_color=_cv,      bgcolor=_bg0, text_size=size.small)
+        table.cell(bt_tbl, 1, 2, f_pct(_ss_wr_n, ss_total), text_color=ss_wr_col, bgcolor=_bg0, text_size=size.small)
+        table.cell(bt_tbl, 2, 2, f_pct(_ac_wr_n, ac_total), text_color=ac_wr_col, bgcolor=_bg0, text_size=size.small)
+
+        // ── Extensión a 2R ────────────────────────────────────────────────────────
+        table.cell(bt_tbl, 0, 3, "2R (de 1R)", text_color=_cv,   bgcolor=_bg1, text_size=size.small)
+        table.cell(bt_tbl, 1, 3, f_pct(ss_r2, ss_r1), text_color=_gold, bgcolor=_bg1, text_size=size.small)
+        table.cell(bt_tbl, 2, 3, f_pct(ac_r2, ac_r1), text_color=_gold, bgcolor=_bg1, text_size=size.small)
+
+        // ── Extensión a 3R ────────────────────────────────────────────────────────
+        table.cell(bt_tbl, 0, 4, "3R (de 2R)", text_color=_cv,   bgcolor=_bg0, text_size=size.small)
+        table.cell(bt_tbl, 1, 4, f_pct(ss_r3, ss_r2), text_color=_gold, bgcolor=_bg0, text_size=size.small)
+        table.cell(bt_tbl, 2, 4, f_pct(ac_r3, ac_r2), text_color=_gold, bgcolor=_bg0, text_size=size.small)
+
+        // ── Barra visual acumulado ─────────────────────────────────────────────────
+        table.cell(bt_tbl, 0, 5, "1R",         text_color=_dim,  bgcolor=_bg1, text_size=size.tiny)
+        table.cell(bt_tbl, 1, 5, "",           text_color=_dim,  bgcolor=_bg1, text_size=size.tiny)
+        table.cell(bt_tbl, 2, 5, f_r_bar(ac_r1, ac_total), text_color=_good, bgcolor=_bg1, text_size=size.tiny)
+
+        table.cell(bt_tbl, 0, 6, "2R",         text_color=_dim,  bgcolor=_bg0, text_size=size.tiny)
+        table.cell(bt_tbl, 1, 6, "",           text_color=_dim,  bgcolor=_bg0, text_size=size.tiny)
+        table.cell(bt_tbl, 2, 6, f_r_bar(ac_r2, ac_r1),  text_color=_gold, bgcolor=_bg0, text_size=size.tiny)
+
+        table.cell(bt_tbl, 0, 7, "3R",         text_color=_dim,  bgcolor=_bg1, text_size=size.tiny)
+        table.cell(bt_tbl, 1, 7, "",           text_color=_dim,  bgcolor=_bg1, text_size=size.tiny)
+        table.cell(bt_tbl, 2, 7, f_r_bar(ac_r3, ac_r2),  text_color=_gold, bgcolor=_bg1, text_size=size.tiny)
+
+        // ── Separador ─────────────────────────────────────────────────────────────
+        table.cell(bt_tbl, 0, 8, "──",         text_color=_dim, bgcolor=_bg0, text_size=size.tiny)
+        table.cell(bt_tbl, 1, 8, "──────",     text_color=_dim, bgcolor=_bg0, text_size=size.tiny)
+        table.cell(bt_tbl, 2, 8, "──────",     text_color=_dim, bgcolor=_bg0, text_size=size.tiny)
+
+        // ── Por modo TF vs MR ─────────────────────────────────────────────────────
+        tf_col = ac_tf > 0 ? (float(ac_tf_r1)/float(ac_tf) >= 0.5 ? _good : _bad) : _dim
+        mr_col = ac_mr > 0 ? (float(ac_mr_r1)/float(ac_mr) >= 0.5 ? _good : _bad) : _dim
+        table.cell(bt_tbl, 0, 9,  "TF",        text_color=_cv,  bgcolor=_bg1, text_size=size.small)
+        table.cell(bt_tbl, 1, 9,  str.tostring(ac_tf) + " trades", text_color=_dim, bgcolor=_bg1, text_size=size.small)
+        table.cell(bt_tbl, 2, 9,  f_pct(ac_tf_r1, ac_tf), text_color=tf_col, bgcolor=_bg1, text_size=size.small)
+
+        table.cell(bt_tbl, 0, 10, "MR",        text_color=_cv,  bgcolor=_bg0, text_size=size.small)
+        table.cell(bt_tbl, 1, 10, str.tostring(ac_mr) + " trades", text_color=_dim, bgcolor=_bg0, text_size=size.small)
+        table.cell(bt_tbl, 2, 10, f_pct(ac_mr_r1, ac_mr), text_color=mr_col, bgcolor=_bg0, text_size=size.small)
+
+        // ── LONG vs SHORT ─────────────────────────────────────────────────────────
+        lng_col = ac_long  > 0 ? (float(ac_long_r1) /float(ac_long)  >= 0.5 ? _good : _bad) : _dim
+        sht_col = ac_short > 0 ? (float(ac_short_r1)/float(ac_short) >= 0.5 ? _good : _bad) : _dim
+        table.cell(bt_tbl, 0, 11, "L " + f_pct(ac_long_r1, ac_long) + " / S " + f_pct(ac_short_r1, ac_short),
+                   text_color=_dim, bgcolor=_bg1, text_size=size.tiny)
+        table.cell(bt_tbl, 1, 11, "", bgcolor=_bg1)
+        table.cell(bt_tbl, 2, 11, "activo: " + (tr_state != "FLAT" ? tr_state : "—"),
+                   text_color=_dim, bgcolor=_bg1, text_size=size.tiny)
+
+        // ── Separador contadores absolutos ────────────────────────────────────────
+        table.cell(bt_tbl, 0, 12, "──",      text_color=_dim, bgcolor=_bg0, text_size=size.tiny)
+        table.cell(bt_tbl, 1, 12, "──────",  text_color=_dim, bgcolor=_bg0, text_size=size.tiny)
+        table.cell(bt_tbl, 2, 12, "contadores acumulados", text_color=_dim, bgcolor=_bg0, text_size=size.tiny)
+
+        // ── Header contadores ─────────────────────────────────────────────────────
+        table.cell(bt_tbl, 0, 13, "",        text_color=_dim,  bgcolor=_bg1, text_size=size.tiny)
+        table.cell(bt_tbl, 1, 13, "n",       text_color=_dim,  bgcolor=_bg1, text_size=size.tiny)
+        table.cell(bt_tbl, 2, 13, "% total", text_color=_dim,  bgcolor=_bg1, text_size=size.tiny)
+        // Nota: WR real con TP en 3R = ac_r3 / ac_total (solo gana si llega a 3R)
+
+        // ── 0.5R — tocaron 0.5R (incluye los que también llegaron a 1R+) ────────────
+        color _r05_col = ac_r05 > 0 ? color.new(#00e5a0, 40) : _dim
+        // ac_r05_only = tocaron 0.5R pero NO 1R (SL tras 0.5R)
+        int ac_r05_only = ac_r05 - ac_r1  // los que tocaron 0.5R pero no continuaron a 1R
+        // Nota: ac_r05 incluye TODOS los que tocaron 0.5R (también los que llegaron a 1R+)
+        table.cell(bt_tbl, 0, 14, "0.5R",    text_color=_r05_col, bgcolor=_bg1, text_size=size.small)
+        table.cell(bt_tbl, 1, 14, str.tostring(ac_r05) + " (" + str.tostring(math.max(0, ac_r05_only)) + "↩)", text_color=_r05_col, bgcolor=_bg1, text_size=size.small)
+        table.cell(bt_tbl, 2, 14, f_pct(ac_r05, ac_total), text_color=_r05_col, bgcolor=_bg1, text_size=size.small)
+
+        // ── 1R ────────────────────────────────────────────────────────────────────
+        table.cell(bt_tbl, 0, 15, "1R",      text_color=_good, bgcolor=_bg0, text_size=size.small)
+        table.cell(bt_tbl, 1, 15, str.tostring(ac_r1), text_color=_good, bgcolor=_bg0, text_size=size.small)
+        table.cell(bt_tbl, 2, 15, f_pct(ac_r1, ac_total), text_color=_good, bgcolor=_bg0, text_size=size.small)
+
+        // ── 2R ────────────────────────────────────────────────────────────────────
+        table.cell(bt_tbl, 0, 16, "2R",      text_color=_gold, bgcolor=_bg1, text_size=size.small)
+        table.cell(bt_tbl, 1, 16, str.tostring(ac_r2), text_color=_gold, bgcolor=_bg1, text_size=size.small)
+        table.cell(bt_tbl, 2, 16, f_pct(ac_r2, ac_total), text_color=_gold, bgcolor=_bg1, text_size=size.small)
+
+        // ── 3R ────────────────────────────────────────────────────────────────────
+        table.cell(bt_tbl, 0, 17, "3R",      text_color=_gold, bgcolor=_bg0, text_size=size.small)
+        table.cell(bt_tbl, 1, 17, str.tostring(ac_r3), text_color=_gold, bgcolor=_bg0, text_size=size.small)
+        table.cell(bt_tbl, 2, 17, f_pct(ac_r3, ac_total), text_color=_gold, bgcolor=_bg0, text_size=size.small)
+
+        // ── SL — trades que nunca tocaron 1R ──────────────────────────────────────
+        table.cell(bt_tbl, 0, 18, "SL",      text_color=_bad,  bgcolor=_bg1, text_size=size.small)
+        table.cell(bt_tbl, 1, 18, str.tostring(ac_sl), text_color=_bad,  bgcolor=_bg1, text_size=size.small)
+        table.cell(bt_tbl, 2, 18, f_pct(ac_sl, ac_total), text_color=_bad,  bgcolor=_bg1, text_size=size.small)
+
+        // ── Volatilidad de sesión actual ──────────────────────────────────────────
+        string _bt_vol_str = sess_atr_count < 3 ? "⏳" : str.tostring(math.round(sess_atr, 1)) + "pts"
+        table.cell(bt_tbl, 0, 18, "Vol ATR",     text_color=_cv,            bgcolor=_bg1, text_size=size.small)
+        color _btv_bg = vol_too_high ? color.new(#ff3d5a, 80) : _bg1
+        table.cell(bt_tbl, 1, 18, _bt_vol_str, text_color=vol_regime_col, bgcolor=_btv_bg, text_size=size.small)
+        table.cell(bt_tbl, 2, 18, vol_regime,  text_color=vol_regime_col, bgcolor=_btv_bg, text_size=size.tiny)
+
+        // ── Separador rachas ──────────────────────────────────────────────────────
+        table.cell(bt_tbl, 0, 19, "──",      text_color=_dim, bgcolor=_bg0, text_size=size.tiny)
+        table.cell(bt_tbl, 1, 19, "──────",  text_color=_dim, bgcolor=_bg0, text_size=size.tiny)
+        table.cell(bt_tbl, 2, 19, "rachas / PnL",   text_color=_dim, bgcolor=_bg0, text_size=size.tiny)
+
+        // ── Racha WR actual ───────────────────────────────────────────────────────
+        color _wr_streak_col = ac_streak_wr >= 3 ? _good : ac_streak_wr >= 1 ? color.new(#00e5a0, 40) : _dim
+        table.cell(bt_tbl, 0, 20, "WR racha",  text_color=_cv,           bgcolor=_bg1, text_size=size.small)
+        table.cell(bt_tbl, 1, 20, str.tostring(ac_streak_wr) + " seguidos", text_color=_wr_streak_col, bgcolor=_bg1, text_size=size.small)
+        table.cell(bt_tbl, 2, 21, "máx: " + str.tostring(ac_max_wr),     text_color=_dim,             bgcolor=_bg1, text_size=size.small)
+
+        // ── Racha SL actual ───────────────────────────────────────────────────────
+        color _sl_streak_col = ac_streak_sl >= 3 ? _bad : ac_streak_sl >= 1 ? color.new(#ff3d5a, 40) : _dim
+        table.cell(bt_tbl, 0, 21, "SL racha",  text_color=_cv,           bgcolor=_bg0, text_size=size.small)
+        table.cell(bt_tbl, 1, 21, str.tostring(ac_streak_sl) + " seguidos", text_color=_sl_streak_col, bgcolor=_bg0, text_size=size.small)
+        table.cell(bt_tbl, 2, 21, "máx: " + str.tostring(ac_max_sl),     text_color=_dim,             bgcolor=_bg0, text_size=size.small)
+
+        // ── Variables de riesgo calculadas desde i_pmt_risk ─────────────────────
+        // Todas las cifras de PnL se calculan en base al riesgo configurado
+        float _R    = i_pmt_risk          // riesgo total por trade
+        float _h    = _R / 2.0            // mitad del riesgo (por posición)
+        float _r05g = _h * 0.5            // ganancia 0.5R de la mitad = R×0.25
+        float _r1g  = _h * 1.0            // ganancia 1R de la mitad = R×0.5
+        float _r2g  = _h * 2.0            // ganancia 2R de la mitad = R×1.0
+        float _r3g  = _h * 3.0            // ganancia 3R de la mitad = R×1.5
+        // Ejemplos con $650: _h=325, _r05g=162.5, _r1g=325, _r2g=650, _r3g=975
+
+        // ── Recalcular PnL desde arrays del log según modo de salida activo ──────
+        // Esto permite cambiar i_exit_mode y ver el resultado actualizado al instante
+        float _calc_pnl  = 0.0
+        float _calc_peak = 0.0
+        float _calc_dd   = 0.0
+        float _calc_max_dd = 0.0
+        int   _n_log     = array.size(lg_result)
+        for _j = 0 to math.max(0, _n_log - 1)
+            if _n_log == 0
+                break
+            string _res_j = array.get(lg_result, _j)
+            if _res_j != "OPEN"
+                bool _j_r05 = array.get(lg_r05, _j) == "✓"  // ahora exacto
+                bool _j_r1  = array.get(lg_r1,  _j) == "✓"
+                bool _j_r2  = array.get(lg_r2,  _j) == "✓"
+                bool _j_r3  = array.get(lg_r3,  _j) == "✓"
+                float _j_pnl = 0.0
+                if i_exit_mode == "TP en 1R honesto (PMT)"
+                    // Refleja exactamente PMT con TP en 1R — el modo actual
+                    _j_pnl := _j_r1 ? _R : -_R
+                else if i_exit_mode == "TP en 2R honesto (PMT)"
+                    // Solo gana si llega a 2R — si llega a 1R y revierte → SL
+                    _j_pnl := _j_r2 ? _R * 2.0 : -_R
+                else if i_exit_mode == "Optimizado: 0.5R-1R-1.5R-2R-3R"
+                    // PnL basado en el resultado real ya calculado en lg_result
+                    string _qres_opt = array.get(lg_result, _j)
+                    if _qres_opt == "+3R"
+                        _j_pnl := _R * 3.0
+                    else if _qres_opt == "+0.75R"
+                        _j_pnl := _R * 0.75
+                    else if _qres_opt == "BE"
+                        _j_pnl := 0.0
+                    else if _qres_opt == "-0.15R"
+                        _j_pnl := -(_R * 0.15)
+                    else if _qres_opt == "+0.5R"
+                        _j_pnl := _R * 0.5
+                    else if _qres_opt == "SL"
+                        _j_pnl := -_R
+                    else if str.contains(_qres_opt, "R")
+                        string _ropt_str = str.replace(str.replace(_qres_opt, "+", ""), "R", "")
+                        _ropt_str := str.replace(_ropt_str, "BE", "0")
+                        float _eod_opt_r = str.tonumber(_ropt_str)
+                        _j_pnl := na(_eod_opt_r) ? 0.0 : _eod_opt_r * _R
+                    else
+                        _j_pnl := -_R
+                else if i_exit_mode == "BE en 0.5R + runner a 3R"
+                    // Gestión manual exacta con BE — usando datos reales del tracker
+                    // El tracker ahora sabe si el precio tocó cada nivel de BE
+                    float _be_buffer_loss = _R * 0.20
+                    bool _j_be_buf  = array.get(lg_be_buf,  _j) == "✓"  // tocó buffer post-0.5R
+                    bool _j_be_ex   = array.get(lg_be_ex,   _j) == "✓"  // tocó BE exacto post-1R
+                    bool _j_be_lock = array.get(lg_be_lock, _j) == "✓"  // tocó lock post-2R
+                    bool _j_r2_be   = array.get(lg_r2, _j) == "✓"
+
+                    if not _j_r05
+                        _j_pnl := -_R                    // Caso 1: SL directo
+                    else if _j_be_buf and not _j_r1
+                        _j_pnl := -_be_buffer_loss        // Caso 2a: buffer activado → cerrado
+                    else if not _j_r1
+                        _j_pnl := -_be_buffer_loss        // Caso 2b: tocó 0.5R, no llegó a 1R
+                    else if _j_be_ex and not _j_r2_be
+                        _j_pnl := 0.0                    // Caso 3a: BE exacto activado post-1R
+                    else if not _j_r2_be
+                        _j_pnl := 0.0                    // Caso 3b: llegó a 1R, no a 2R
+                    else if _j_be_lock and not _j_r3
+                        _j_pnl := _R                     // Caso 4a: lock 1R activado post-2R
+                    else if not _j_r3
+                        _j_pnl := _R                     // Caso 4b: llegó a 2R, no a 3R
+                    else
+                        _j_pnl := _R * 3.0               // Caso 5: 3R completo
+                else if i_exit_mode == "50% en 0.5R + runner en 1R"
+                    // Escenario conservador: runner siempre se cierra en 1R
+                    // Si llega a 1R → 0.5R (+R×0.25) + runner en 1R (+R×0.5) = +R×0.75
+                    // Si 0.5R↩ → 0.5R (+R×0.25) + runner SL (-R×0.5) = -R×0.25
+                    // Si SL completo → -R
+                    if not _j_r05
+                        _j_pnl := -_R              // SL completo
+                    else if not _j_r1
+                        _j_pnl := _r05g - _h       // 0.5R OK, runner SL = -R×0.25
+                    else
+                        _j_pnl := _r05g + _h       // 0.5R + runner cerrado en 1R = +R×0.75
+                else if i_exit_mode == "50% en 0.5R + runner promedio"
+                    // Escenario promedio histórico: runner promedio = +0.61R
+                    // Basado en datos reales: (49×3+18×2+35×1-41×1-56×1)/199 = 0.61R
+                    // Si llega a 1R → 0.5R (+R×0.25) + runner promedio (+R×0.305) = +R×0.555
+                    // Si 0.5R↩ → 0.5R (+R×0.25) + runner SL (-R×0.5) = -R×0.25
+                    // Si SL completo → -R
+                    float _runner_avg_r = 0.61     // promedio histórico del runner
+                    if not _j_r05
+                        _j_pnl := -_R
+                    else if not _j_r1
+                        _j_pnl := _r05g - _h       // 0.5R OK, runner SL
+                    else
+                        _j_pnl := _r05g + (_h * _runner_avg_r)  // 0.5R + runner promedio
+                else if i_exit_mode == "50% en 0.5R + 50% libre"
+                    // Runner tiene TP en 3R en PMT — si no llega a 3R, cierra en SL
+                    // SL completo → -R
+                    // 0.5R + runner SL → +R×0.25 - R×0.5 = -R×0.25
+                    // 0.5R + runner a 3R → +R×0.25 + R×1.5 = +R×1.75
+                    if not _j_r05
+                        _j_pnl := -_R
+                    else if not _j_r3
+                        _j_pnl := _r05g - _h   // 0.5R ganado - runner SL
+                    else
+                        _j_pnl := _r05g + _r3g  // 0.5R + runner a 3R
+                else if i_exit_mode == "TP en 3R honesto (PMT)"
+                    _j_pnl := _j_r3 ? _R * 3.0 : -_R
+                else if i_exit_mode == "Todo en max R"
+                    _j_pnl := _j_r3 ? _R * 3.0 : _j_r2 ? _R * 2.0 : _j_r1 ? _R : -_R
+                else if i_exit_mode == "50% en 1R + 50% en max R"
+                    if not _j_r1
+                        _j_pnl := -_R
+                    else
+                        _j_pnl := _h + (_j_r3 ? _r3g : _j_r2 ? _r2g : -_h)
+                else
+                    // "50% en 1R + 50% en 3R fijo"
+                    if not _j_r1
+                        _j_pnl := -_R
+                    else
+                        _j_pnl := _h + (_j_r3 ? _r3g : -_h)
+                _calc_pnl := _calc_pnl + _j_pnl
+                if _calc_pnl > _calc_peak
+                    _calc_peak := _calc_pnl
+                _calc_dd := _calc_peak - _calc_pnl
+                if _calc_dd > _calc_max_dd
+                    _calc_max_dd := _calc_dd
+
+        // ── Separador PnL ─────────────────────────────────────────────────────────
+        table.cell(bt_tbl, 0, 22, "──",      text_color=_dim, bgcolor=_bg1, text_size=size.tiny)
+        table.cell(bt_tbl, 1, 22, "──────",  text_color=_dim, bgcolor=_bg1, text_size=size.tiny)
+        string _exit_short = i_exit_mode == "TP en 1R honesto (PMT)" ? "TP@1R honesto" : i_exit_mode == "TP en 2R honesto (PMT)" ? "TP@2R honesto" : i_exit_mode == "TP en 3R honesto (PMT)" ? "TP@3R honesto" : i_exit_mode == "BE en 0.5R + runner a 3R" ? "BE@0.5R+3R" : i_exit_mode == "50% en 0.5R + runner en 1R" ? "0.5R+runner@1R" : i_exit_mode == "50% en 0.5R + runner promedio" ? "0.5R+runner~0.61R" : i_exit_mode == "50% en 0.5R + 50% libre" ? "50%@0.5R+runner*" : i_exit_mode == "Todo en max R" ? "100% max R" : i_exit_mode == "50% en 1R + 50% en max R" ? "50%@1R+50%@maxR" : "50%@1R+50%@3R"
+        table.cell(bt_tbl, 2, 22, "$" + str.tostring(math.round(i_pmt_risk)) + " | " + _exit_short, text_color=_dim, bgcolor=_bg1, text_size=size.tiny)
+
+        // ── PnL acumulado ─────────────────────────────────────────────────────────
+        color _pnl_col = _calc_pnl > 0 ? _good : _calc_pnl < 0 ? _bad : _dim
+        string _pnl_str = (_calc_pnl >= 0 ? "+" : "") + "$" + str.tostring(math.round(_calc_pnl))
+        table.cell(bt_tbl, 0, 23, "PnL",     text_color=_cv,      bgcolor=_bg0, text_size=size.small)
+        table.cell(bt_tbl, 1, 23, _pnl_str,  text_color=_pnl_col, bgcolor=_bg0, text_size=size.small)
+        table.cell(bt_tbl, 2, 23, str.tostring(math.round(_calc_pnl / math.max(ac_total, 1))) + "$/trade avg", text_color=_dim, bgcolor=_bg0, text_size=size.small)
+
+        // ── R/trade promedio ──────────────────────────────────────────────────────
+        float _avg_r = ac_total > 0 ? _calc_pnl / (float(ac_total) * i_pmt_risk) : 0.0
+        string _avg_r_str = (_calc_pnl >= 0 ? "+" : "") + str.tostring(math.round(_avg_r * 100) / 100.0) + "R avg"
+        table.cell(bt_tbl, 0, 24, "R/trade", text_color=_cv,       bgcolor=_bg1, text_size=size.small)
+        table.cell(bt_tbl, 1, 24, _avg_r_str, text_color=_pnl_col, bgcolor=_bg1, text_size=size.small)
+        table.cell(bt_tbl, 2, 24, "", bgcolor=_bg1)
+
+        // ── Max Drawdown ──────────────────────────────────────────────────────────
+        color _dd_col = _calc_max_dd > 2000 ? _bad : _calc_max_dd > 800 ? _gold : _good
+        table.cell(bt_tbl, 0, 25, "Max DD",  text_color=_cv,    bgcolor=_bg0, text_size=size.small)
+        table.cell(bt_tbl, 1, 25, "-$" + str.tostring(math.round(_calc_max_dd)), text_color=_dd_col, bgcolor=_bg0, text_size=size.small)
+        table.cell(bt_tbl, 2, 25, str.tostring(math.round(_calc_max_dd / i_pmt_risk * 10) / 10.0) + "R", text_color=_dd_col, bgcolor=_bg0, text_size=size.small)
+
+        // ── Pico máximo PnL ───────────────────────────────────────────────────────
+        table.cell(bt_tbl, 0, 26, "Pico",    text_color=_cv,   bgcolor=_bg1, text_size=size.small)
+        table.cell(bt_tbl, 1, 26, "+$" + str.tostring(math.round(_calc_peak)), text_color=_good, bgcolor=_bg1, text_size=size.small)
+        table.cell(bt_tbl, 2, 26, "", bgcolor=_bg1)
+
+
+
+        // ══════════════════════════════════════════════════════════════════════════
+        // ── QUALITY SCORE — SQN adaptado para prop firm ────────────────────────
+        // Combina: SQN base × factor_confianza × factor_DD × factor_consistencia
+        // Referencia: Van Tharp SQN = (E(R)/StdDev(R)) × sqrt(n)
+        // Adaptado: penaliza DD alto, rachas largas y muestras pequeñas
+        // ══════════════════════════════════════════════════════════════════════════
+        table.cell(bt_tbl, 0, 27, "──",     text_color=_dim, bgcolor=_bg0, text_size=size.tiny)
+        table.cell(bt_tbl, 1, 27, "──────", text_color=_dim, bgcolor=_bg0, text_size=size.tiny)
+        table.cell(bt_tbl, 2, 27, "QUALITY SCORE", text_color=_info, bgcolor=_bg0, text_size=size.tiny)
+
+        // ── Calcular R de cada trade según el modo de salida activo ──────────────
+        // Reutilizamos los arrays del log — mismo cálculo que el PnL
+        float _sqn_sum_r    = 0.0   // suma de R
+        float _sqn_sum_r2   = 0.0   // suma de R²
+        int   _sqn_n        = 0     // trades cerrados
+        float _sqn_r_val    = 0.0
+
+        int _sqn_log_n = array.size(lg_result)
+        for _qi = 0 to math.max(0, _sqn_log_n - 1)
+            if _sqn_log_n == 0
+                break
+            string _qres = array.get(lg_result, _qi)
+            if _qres != "OPEN"
+                bool _qr05 = array.get(lg_r05, _qi) == "✓"
+                bool _qr1  = array.get(lg_r1,  _qi) == "✓"
+                bool _qr2  = array.get(lg_r2,  _qi) == "✓"
+                bool _qr3  = array.get(lg_r3,  _qi) == "✓"
+                // R del trade según modo de salida
+                if i_exit_mode == "TP en 1R honesto (PMT)"
+                    _sqn_r_val := _qr1 ? 1.0 : -1.0
+                else if i_exit_mode == "TP en 2R honesto (PMT)"
+                    _sqn_r_val := _qr2 ? 2.0 : -1.0
+                else if i_exit_mode == "TP en 3R honesto (PMT)"
+                    _sqn_r_val := _qr3 ? 3.0 : -1.0
+                else if i_exit_mode == "BE en 0.5R + runner a 3R"
+                    bool _qbe_buf  = array.size(lg_be_buf)  > _qi ? array.get(lg_be_buf,  _qi) == "✓" : false
+                    bool _qbe_ex   = array.size(lg_be_ex)   > _qi ? array.get(lg_be_ex,   _qi) == "✓" : false
+                    bool _qbe_lock = array.size(lg_be_lock) > _qi ? array.get(lg_be_lock, _qi) == "✓" : false
+                    _sqn_r_val := not _qr05 ? -1.0 : not _qr1 ? -0.2 : not _qr2 ? 0.0 : not _qr3 ? 1.0 : 3.0
+                else if i_exit_mode == "Todo en max R"
+                    _sqn_r_val := _qr3 ? 3.0 : _qr2 ? 2.0 : _qr1 ? 1.0 : -1.0
+                else
+                    _sqn_r_val := _qr1 ? 1.0 : -1.0
+                _sqn_sum_r  += _sqn_r_val
+                _sqn_sum_r2 += _sqn_r_val * _sqn_r_val
+                _sqn_n      += 1
+
+        // ── SQN base ──────────────────────────────────────────────────────────────
+        float _sqn_er     = _sqn_n > 0 ? _sqn_sum_r / float(_sqn_n) : 0.0
+        float _sqn_er2    = _sqn_n > 0 ? _sqn_sum_r2 / float(_sqn_n) : 0.0
+        float _sqn_var    = math.max(0.0, _sqn_er2 - _sqn_er * _sqn_er)
+        float _sqn_std    = _sqn_var > 0 ? math.sqrt(_sqn_var) : 0.001
+        float _sqn_base   = _sqn_n > 0 ? (_sqn_er / _sqn_std) * math.sqrt(float(_sqn_n)) : 0.0
+
+        // ── Factor de confianza estadística ───────────────────────────────────────
+        // < 20 trades: ×0.50 | 20-30: ×0.75 | 30-50: ×0.90 | >50: ×1.00
+        float _f_conf = _sqn_n < 20 ? 0.50 : _sqn_n < 30 ? 0.75 : _sqn_n < 50 ? 0.90 : 1.00
+
+        // ── Factor DD (Apex prop firm) ────────────────────────────────────────────
+        // Max DD vs límite $2,400 (trailing DD Apex $50K)
+        // < $1,300 (2R): ×1.00 | $1,300-$2,000: ×0.85 | $2,000-$2,400: ×0.70 | >$2,400: ×0.00
+        float _f_dd = _calc_max_dd > 2400.0 ? 0.00 : _calc_max_dd > 2000.0 ? 0.70 : _calc_max_dd > 1300.0 ? 0.85 : 1.00
+
+        // ── Factor consistencia (rachas de SL) ────────────────────────────────────
+        // Max racha SL ≤2: ×1.00 | =3: ×0.85 | =4: ×0.70 | ≥5: ×0.50
+        float _f_cons = ac_max_sl >= 5 ? 0.50 : ac_max_sl >= 4 ? 0.70 : ac_max_sl >= 3 ? 0.85 : 1.00
+
+        // ── Quality Score final ───────────────────────────────────────────────────
+        float _qs = _sqn_base * _f_conf * _f_dd * _f_cons
+        float _qs_r = math.round(_qs * 100) / 100.0
+
+        // Clasificación
+        string _qs_grade = _calc_max_dd > 2400 ? "⛔ VIOLA APEX" : _qs >= 3.0 ? "✅ EXCELENTE" : _qs >= 2.0 ? "✓ BUENA" : _qs >= 1.0 ? "~ REGULAR" : "✗ MALA"
+        color  _qs_col   = _calc_max_dd > 2400 ? _bad : _qs >= 3.0 ? _good : _qs >= 2.0 ? color.new(#00e5a0, 40) : _qs >= 1.0 ? _gold : _bad
+
+        // ── Mostrar Quality Score ─────────────────────────────────────────────────
+        table.cell(bt_tbl, 0, 28, "Quality Score", text_color=_cv,     bgcolor=color.new(#0d1a24,0), text_size=size.small)
+        table.cell(bt_tbl, 1, 28, str.tostring(_qs_r), text_color=_qs_col, bgcolor=color.new(#0d1a24,0), text_size=size.normal)
+        table.cell(bt_tbl, 2, 28, _qs_grade,       text_color=_qs_col, bgcolor=color.new(#0d1a24,0), text_size=size.small)
+
+        // ── Desglose de factores ──────────────────────────────────────────────────
+        table.cell(bt_tbl, 0, 29, "SQN base",      text_color=_cv,   bgcolor=_bg1, text_size=size.small)
+        table.cell(bt_tbl, 1, 29, str.tostring(math.round(_sqn_base * 100) / 100.0), text_color=_dim, bgcolor=_bg1, text_size=size.small)
+        table.cell(bt_tbl, 2, 29, "E(R)=" + str.tostring(math.round(_sqn_er * 100) / 100.0) + "R  σ=" + str.tostring(math.round(_sqn_std * 100) / 100.0), text_color=_dim, bgcolor=_bg1, text_size=size.tiny)
+
+        table.cell(bt_tbl, 0, 30, "× Confianza",   text_color=_cv,   bgcolor=_bg0, text_size=size.small)
+        color _fc_col = _f_conf >= 1.0 ? _good : _f_conf >= 0.75 ? _gold : _bad
+        table.cell(bt_tbl, 1, 30, "×" + str.tostring(_f_conf), text_color=_fc_col, bgcolor=_bg0, text_size=size.small)
+        table.cell(bt_tbl, 2, 30, str.tostring(_sqn_n) + " trades" + (_sqn_n < 20 ? " ⚠ pocos" : _sqn_n < 30 ? " ~ok" : " ✓"), text_color=_fc_col, bgcolor=_bg0, text_size=size.tiny)
+
+        table.cell(bt_tbl, 0, 31, "× Factor DD",   text_color=_cv,   bgcolor=_bg1, text_size=size.small)
+        color _fd_col = _f_dd >= 1.0 ? _good : _f_dd >= 0.85 ? _gold : _f_dd > 0 ? _bad : color.new(#ff3d5a, 0)
+        table.cell(bt_tbl, 1, 31, "×" + str.tostring(_f_dd), text_color=_fd_col, bgcolor=_bg1, text_size=size.small)
+        table.cell(bt_tbl, 2, 31, "MaxDD $" + str.tostring(math.round(_calc_max_dd)) + (_calc_max_dd > 2400 ? " ⛔ APEX" : _calc_max_dd > 2000 ? " ⚠" : " ✓"), text_color=_fd_col, bgcolor=_bg1, text_size=size.tiny)
+
+        table.cell(bt_tbl, 0, 32, "× Consistencia",text_color=_cv,   bgcolor=_bg0, text_size=size.small)
+        color _fk_col = _f_cons >= 1.0 ? _good : _f_cons >= 0.85 ? _gold : _bad
+        table.cell(bt_tbl, 1, 32, "×" + str.tostring(_f_cons), text_color=_fk_col, bgcolor=_bg0, text_size=size.small)
+        table.cell(bt_tbl, 2, 32, "Racha SL máx " + str.tostring(ac_max_sl) + (ac_max_sl >= 5 ? " ⚠" : " ✓"), text_color=_fk_col, bgcolor=_bg0, text_size=size.tiny)
+
+        table.cell(bt_tbl, 0, 33, "──",            text_color=_dim,  bgcolor=_bg1, text_size=size.tiny)
+        table.cell(bt_tbl, 1, 33, "──────",        text_color=_dim,  bgcolor=_bg1, text_size=size.tiny)
+        table.cell(bt_tbl, 2, 33, "──────────────",text_color=_dim,  bgcolor=_bg1, text_size=size.tiny)
+
+        // ── Sesgo de período ─────────────────────────────────────────────────────
+        table.cell(bt_tbl, 0, 33, "Sesgo período", text_color=_cv,            bgcolor=_bg1, text_size=size.small)
+        table.cell(bt_tbl, 1, 33, period_bias_str, text_color=period_bias_col, bgcolor=_bg1, text_size=size.small)
+        table.cell(bt_tbl, 2, 33, period_bias_detail + (i_bias_auto ? "  auto" : "  manual"), text_color=period_bias_col, bgcolor=_bg1, text_size=size.tiny)
+
+        // ── Dirección efectiva activa ─────────────────────────────────────────────
+        color  _eff_col = effective_dir == "Solo LONG" ? _good : effective_dir == "Solo SHORT" ? _bad : _dim
+        string _eff_icon = effective_dir == "Solo LONG" ? "▲" : effective_dir == "Solo SHORT" ? "▼" : "▲▼"
+        table.cell(bt_tbl, 0, 34, "Dir. efectiva", text_color=_cv,                           bgcolor=_bg0, text_size=size.small)
+        table.cell(bt_tbl, 1, 34, _eff_icon + " " + effective_dir,             text_color=_eff_col, bgcolor=_bg0, text_size=size.small)
+        table.cell(bt_tbl, 2, 34, i_bias_auto and not period_bias_neutral ? "⚠ auto" : "manual", text_color=_eff_col, bgcolor=_bg0, text_size=size.tiny)
+
+        // ── Grade mínimo activo ──────────────────────────────────────────────────
+        color _grd_col  = i_min_grade == "B" ? _dim : i_min_grade == "A" ? _gold : _good
+        string _grd_str = i_min_grade == "A+" ? "A+ only" : i_min_grade == "A" ? "A y A+" : "B, A y A+"
+        string _grd_tag = i_min_grade == "B" ? "sin filtro" : "⚠ filtro activo"
+        table.cell(bt_tbl, 0, 34, "Min Grade", text_color=_cv,      bgcolor=_bg0, text_size=size.small)
+        table.cell(bt_tbl, 1, 34, _grd_str,   text_color=_grd_col, bgcolor=_bg0, text_size=size.small)
+        table.cell(bt_tbl, 2, 34, _grd_tag,   text_color=_grd_col, bgcolor=_bg0, text_size=size.tiny)
+
+        // ── Filtro de dirección activo ────────────────────────────────────────────
+        color _dir_col   = i_dir_filter == "Ambas" ? _dim : _gold
+        string _dir_icon = i_dir_filter == "Solo LONG" ? "▲" : i_dir_filter == "Solo SHORT" ? "▼" : "▲▼"
+        string _dir_str  = _dir_icon + " " + i_dir_filter
+        string _dir_tag  = i_dir_filter != "Ambas" ? "⚠ filtro activo" : "sin filtro"
+        table.cell(bt_tbl, 0, 35, "Dirección", text_color=_cv,      bgcolor=_bg1, text_size=size.small)
+        table.cell(bt_tbl, 1, 35, _dir_str,    text_color=_dir_col, bgcolor=_bg1, text_size=size.small)
+        table.cell(bt_tbl, 2, 35, _dir_tag,    text_color=_dir_col, bgcolor=_bg1, text_size=size.tiny)
+
+        // Fila vacía final
+        table.cell(bt_tbl, 0, 36, "", bgcolor=_bg0)
+        table.cell(bt_tbl, 1, 36, "", bgcolor=_bg0)
+        table.cell(bt_tbl, 2, 36, "", bgcolor=_bg0)
+
+    0
+
+f_draw_bt()
+// ═══════════════════════════════════════════════════════════════════════════════
+//  TRADE LOG DASHBOARD — top right
+//  Muestra los últimos 20 trades con detalle completo de R
+//  Columnas: # | Fecha | Modo | Dir | Entry | SL | 1R | 2R | 3R | Resultado | PnL
+// ═══════════════════════════════════════════════════════════════════════════════
+var table log_tbl = table.new(position.top_right, 11, 102,
+     bgcolor=color.new(#07090c, 5),
+     border_color=color.new(#1e3a4a, 0), border_width=1,
+     frame_color=color.new(#ff9d00, 60), frame_width=1)
+
+f_draw_log() =>
+    if barstate.islast and i_show_log
+        color _lb0  = color.new(#07090c, 0)
+        color _lb1  = color.new(#0d1a24, 0)
+        color _lhdr = color.new(#3a5060, 0)
+        color _lcv  = color.new(#c8d8e0, 0)
+        color _lgood= color.new(#00e5a0, 0)
+        color _lbad = color.new(#ff3d5a, 0)
+        color _lgold= color.new(#ff9d00, 0)
+        color _linfo= color.new(#00d4ff, 0)
+        color _ldim = color.new(#3a5060, 0)
+
+        // ── Header ────────────────────────────────────────────────────────────────
+        table.cell(log_tbl, 0,  0, "#",      text_color=_lhdr, bgcolor=_lb0, text_size=size.tiny)
+        table.cell(log_tbl, 1,  0, "Fecha",  text_color=_lhdr, bgcolor=_lb0, text_size=size.tiny)
+        table.cell(log_tbl, 2,  0, "Modo",   text_color=_lhdr, bgcolor=_lb0, text_size=size.tiny)
+        table.cell(log_tbl, 3,  0, "Dir",    text_color=_lhdr, bgcolor=_lb0, text_size=size.tiny)
+        table.cell(log_tbl, 4,  0, "Entry",  text_color=_lhdr, bgcolor=_lb0, text_size=size.tiny)
+        table.cell(log_tbl, 5,  0, "SL pts", text_color=_lhdr, bgcolor=_lb0, text_size=size.tiny)
+        table.cell(log_tbl, 6,  0, "1R",     text_color=_lhdr, bgcolor=_lb0, text_size=size.tiny)
+        table.cell(log_tbl, 7,  0, "2R",     text_color=_lhdr, bgcolor=_lb0, text_size=size.tiny)
+        table.cell(log_tbl, 8,  0, "3R",     text_color=_lhdr, bgcolor=_lb0, text_size=size.tiny)
+        table.cell(log_tbl, 9,  0, "Res",    text_color=_lhdr, bgcolor=_lb0, text_size=size.tiny)
+        table.cell(log_tbl, 10, 0, "PnL",    text_color=_lhdr, bgcolor=_lb0, text_size=size.tiny)
+
+        // ── Función para calcular PnL de 1 trade según el modo activo ────────────
+        // Usa los mismos 5 casos que el BT para consistencia perfecta
+        _R_log  = i_pmt_risk
+        _h_log  = _R_log / 2.0
+        _r05g_l = _h_log * 0.5
+        _r1g_l  = _h_log * 1.0
+        _r2g_l  = _h_log * 2.0
+        _r3g_l  = _h_log * 3.0
+        _be_buf_l = _R_log * 0.20
+
+        // ── Trade activo (si hay uno) ──────────────────────────────────────────────
+        if tr_state != "FLAT"
+            color _ac = tr_is_long ? _lgood : _lbad
+            table.cell(log_tbl, 0,  1, "→",       text_color=_linfo, bgcolor=_lb1, text_size=size.tiny)
+            table.cell(log_tbl, 1,  1, "ACTIVO",  text_color=_linfo, bgcolor=_lb1, text_size=size.tiny)
+            table.cell(log_tbl, 2,  1, tr_mode,   text_color=_linfo, bgcolor=_lb1, text_size=size.tiny)
+            table.cell(log_tbl, 3,  1, tr_is_long ? "▲" : "▼", text_color=_ac, bgcolor=_lb1, text_size=size.tiny)
+            table.cell(log_tbl, 4,  1, na(tr_entry)  ? "?" : str.tostring(math.round(tr_entry, 1)),  text_color=_lcv,   bgcolor=_lb1, text_size=size.tiny)
+            table.cell(log_tbl, 5,  1, na(tr_sl_pts) ? "?" : str.tostring(math.round(tr_sl_pts, 1)), text_color=_lgold, bgcolor=_lb1, text_size=size.tiny)
+            table.cell(log_tbl, 6,  1, tr_hit_r1 ? "✓" : "·", text_color=tr_hit_r1 ? _lgood : _ldim, bgcolor=_lb1, text_size=size.tiny)
+            table.cell(log_tbl, 7,  1, tr_hit_r2 ? "✓" : "·", text_color=tr_hit_r2 ? _lgood : _ldim, bgcolor=_lb1, text_size=size.tiny)
+            table.cell(log_tbl, 8,  1, tr_hit_r3 ? "✓" : "·", text_color=tr_hit_r3 ? _lgood : _ldim, bgcolor=_lb1, text_size=size.tiny)
+            table.cell(log_tbl, 9,  1, "…",       text_color=_linfo, bgcolor=_lb1, text_size=size.tiny)
+            table.cell(log_tbl, 10, 1, "…",       text_color=_ldim,  bgcolor=_lb1, text_size=size.tiny)
+        else
+            for _c = 0 to 10
+                table.cell(log_tbl, _c, 1, "", bgcolor=_lb1)
+
+        // ── Trades cerrados ───────────────────────────────────────────────────────
+        int _n = array.size(lg_num)
+        for _i = 0 to 99
+            int _row = _i + 2
+            int _idx = _n - 1 - _i
+            color _rbg = _i % 2 == 0 ? _lb0 : _lb1
+
+            if _idx >= 0
+                string _res    = array.get(lg_result, _idx)
+                string _dir    = array.get(lg_dir,    _idx)
+                string _r05v   = array.get(lg_r05,    _idx)
+                string _r1v    = array.get(lg_r1,     _idx)
+                string _r2v    = array.get(lg_r2,     _idx)
+                string _r3v    = array.get(lg_r3,     _idx)
+                bool   _is_open= _res == "OPEN"
+                bool   _j_r05  = _r05v == "✓"
+                bool   _j_r1   = _r1v  == "✓"
+                bool   _j_r2   = _r2v  == "✓"
+                bool   _j_r3   = _r3v  == "✓"
+
+                // Calcular PnL de este trade según el modo activo
+                float _t_pnl = 0.0
+                if not _is_open
+                    if i_exit_mode == "TP en 1R honesto (PMT)"
+                        _t_pnl := _j_r1 ? _R_log : -_R_log
+                    else if i_exit_mode == "TP en 2R honesto (PMT)"
+                        _t_pnl := _j_r2 ? _R_log * 2.0 : -_R_log
+                    else if i_exit_mode == "TP en 3R honesto (PMT)"
+                        _t_pnl := _j_r3 ? _R_log * 3.0 : -_R_log
+                    else if i_exit_mode == "BE en 0.5R + runner a 3R"
+                        float _be_buf_log = _R_log * 0.20
+                        bool _l_be_buf  = array.size(lg_be_buf)  > _idx ? array.get(lg_be_buf,  _idx) == "✓" : false
+                        bool _l_be_ex   = array.size(lg_be_ex)   > _idx ? array.get(lg_be_ex,   _idx) == "✓" : false
+                        bool _l_be_lock = array.size(lg_be_lock) > _idx ? array.get(lg_be_lock, _idx) == "✓" : false
+                        if not _j_r05
+                            _t_pnl := -_R_log
+                        else if _l_be_buf and not _j_r1
+                            _t_pnl := -_be_buf_log
+                        else if not _j_r1
+                            _t_pnl := -_be_buf_log
+                        else if _l_be_ex and not _j_r2
+                            _t_pnl := 0.0
+                        else if not _j_r2
+                            _t_pnl := 0.0
+                        else if _l_be_lock and not _j_r3
+                            _t_pnl := _R_log
+                        else if not _j_r3
+                            _t_pnl := _R_log
+                        else
+                            _t_pnl := _R_log * 3.0
+                    else if i_exit_mode == "50% en 0.5R + runner en 1R"
+                        if not _j_r05
+                            _t_pnl := -_R_log
+                        else if not _j_r1
+                            _t_pnl := _r05g_l - _h_log
+                        else
+                            _t_pnl := _r05g_l + _h_log
+                    else if i_exit_mode == "50% en 0.5R + 50% libre"
+                        if not _j_r05
+                            _t_pnl := -_R_log
+                        else if not _j_r3
+                            _t_pnl := _r05g_l - _h_log
+                        else
+                            _t_pnl := _r05g_l + _r3g_l
+                    else if i_exit_mode == "Todo en max R"
+                        _t_pnl := _j_r3 ? _R_log * 3.0 : _j_r2 ? _R_log * 2.0 : _j_r1 ? _R_log : -_R_log
+                    else if i_exit_mode == "50% en 1R + 50% en 3R fijo"
+                        if not _j_r1
+                            _t_pnl := -_R_log
+                        else
+                            _t_pnl := _h_log + (_j_r3 ? _r3g_l : -_h_log)
+                    else
+                        _t_pnl := _j_r1 ? _R_log : -_R_log
+
+                // Formatear el PnL
+                string _pnl_str = _is_open ? "…" : (_t_pnl >= 0 ? "+" : "") + "$" + str.tostring(math.round(_t_pnl))
+                color  _pnl_col = _is_open ? _ldim : _t_pnl > 0 ? _lgood : _t_pnl < 0 ? _lbad : _ldim
+
+                bool   _is_win  = _res == "+1R" or _res == "+2R" or _res == "+3R"
+                color  _res_col = _is_open ? _linfo : _is_win ? _lgood : _lbad
+                color  _dir_col = _dir == "▲" ? _lgood : _lbad
+                color  _r1_col  = _r1v == "✓" ? _lgood : _r1v == "✗" ? _lbad : _ldim
+                color  _r2_col  = _r2v == "✓" ? _lgood : _r2v == "✗" ? _lbad : _ldim
+                color  _r3_col  = _r3v == "✓" ? _lgood : _r3v == "✗" ? _lbad : _ldim
+                string _mode_v  = array.get(lg_mode, _idx)
+                color  _mode_col= _mode_v == "TF" ? _linfo : _lgold
+
+                table.cell(log_tbl, 0,  _row, str.tostring(array.get(lg_num, _idx)),                  text_color=_ldim,     bgcolor=_rbg, text_size=size.tiny)
+                table.cell(log_tbl, 1,  _row, array.get(lg_time,   _idx),                             text_color=_ldim,     bgcolor=_rbg, text_size=size.tiny)
+                table.cell(log_tbl, 2,  _row, _mode_v,                                                text_color=_mode_col, bgcolor=_rbg, text_size=size.tiny)
+                table.cell(log_tbl, 3,  _row, _dir,                                                   text_color=_dir_col,  bgcolor=_rbg, text_size=size.tiny)
+                table.cell(log_tbl, 4,  _row, str.tostring(math.round(array.get(lg_entry, _idx), 1)), text_color=_lcv,      bgcolor=_rbg, text_size=size.tiny)
+                float _sl_v = array.get(lg_sl_pts, _idx)
+                string _sl_str = na(_sl_v) or _sl_v <= 0 ? "?" : str.tostring(math.round(_sl_v, 1))
+                table.cell(log_tbl, 5,  _row, _sl_str,                                                text_color=_lgold,    bgcolor=_rbg, text_size=size.tiny)
+                table.cell(log_tbl, 6,  _row, _r1v,                                                   text_color=_r1_col,   bgcolor=_rbg, text_size=size.tiny)
+                table.cell(log_tbl, 7,  _row, _r2v,                                                   text_color=_r2_col,   bgcolor=_rbg, text_size=size.tiny)
+                table.cell(log_tbl, 8,  _row, _r3v,                                                   text_color=_r3_col,   bgcolor=_rbg, text_size=size.tiny)
+                table.cell(log_tbl, 9,  _row, _res,                                                   text_color=_res_col,  bgcolor=_rbg, text_size=size.tiny)
+                table.cell(log_tbl, 10, _row, _pnl_str,                                               text_color=_pnl_col,  bgcolor=_rbg, text_size=size.tiny)
+            else
+                for _c = 0 to 10
+                    table.cell(log_tbl, _c, _row, "", bgcolor=_rbg)
+
+    0
+
+f_draw_log()
